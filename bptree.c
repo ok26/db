@@ -96,18 +96,21 @@ void internal_insert(uint32_t key, void *pointer, BPTreeNode *node) {
     }
 
     // Split Node
-    uint32_t spidx = (node->num_keys + 1) / 2;
+    uint32_t spidx = node->num_keys / 2;
     BPTreeNode *r_node = new_node(node->is_leaf);
-    memcpy(&r_node->keys[0], &node->keys[spidx], 
-        (node->num_keys - spidx) * sizeof(uint32_t));
+    
 
     if (node->is_leaf) {
+        memcpy(&r_node->keys[0], &node->keys[spidx], 
+            (node->num_keys - spidx) * sizeof(uint32_t));
         memcpy(&r_node->pointers[1], &node->pointers[spidx + 1],
             (node->num_keys - spidx) * sizeof(void*));
     }
     else {
-        memcpy(&r_node->pointers[0], &node->pointers[spidx],
-            (node->num_keys - spidx + 1) * sizeof(void*));
+        memcpy(&r_node->keys[0], &node->keys[spidx + 1],
+            (node->num_keys - spidx - 1) * sizeof(uint32_t));
+        memcpy(&r_node->pointers[0], &node->pointers[spidx + 1],
+            (node->num_keys - spidx) * sizeof(void*));
     }
     
     
@@ -122,14 +125,20 @@ void internal_insert(uint32_t key, void *pointer, BPTreeNode *node) {
     }
     else {
         // Ignore top key, new leftmost-key splits two values
-        node->num_keys--;
+        r_node->num_keys--;
+
+        // Update children
+        for (int i = 0; i <= r_node->num_keys; i++) {
+            BPTreeNode *child = (BPTreeNode*)r_node->pointers[i];
+            child->parent = r_node;
+        }
     }
 
     // Split root or insert into parent
     if (!node->parent) {
         BPTreeNode *root = new_node(0);
         root->num_keys = 1;
-        root->keys[0] = r_node->keys[0];
+        root->keys[0] = node->keys[node->num_keys];
         root->pointers[0] = node;
         root->pointers[1] = r_node;
 
@@ -138,7 +147,7 @@ void internal_insert(uint32_t key, void *pointer, BPTreeNode *node) {
     }
     else {
         r_node->parent = node->parent;
-        uint32_t prom_key = r_node->keys[0];
+        uint32_t prom_key = node->keys[node->num_keys];
         internal_insert(prom_key, r_node, node->parent);
     }    
 }
@@ -159,6 +168,27 @@ void *get(BPTree *bpt, uint32_t key) {
     }
     else {
         return NULL;
+    }
+}
+
+void range_query(BPTree *bpt, uint32_t key_low, uint32_t key_high, 
+    void (*callback)(uint32_t key, void *value)) {
+    
+    if (key_high < key_low) {
+        return;
+    }
+
+    BPTreeNode *leaf = search(bpt, key_low);
+
+    while (leaf) {
+        for (int i = 0; i < leaf->num_keys; i++) {
+            if (leaf->keys[i] > key_high) return;
+        
+            if (leaf->keys[i] >= key_low) {
+                callback(leaf->keys[i], leaf->pointers[i + 1]);
+            }
+        }
+        leaf = leaf->next;
     }
 }
 
@@ -187,7 +217,8 @@ void print_tree(BPTree *bpt) {
         for (uint32_t i = 0; i < node->num_keys; i++) {
 #ifdef FULL_DEBUG
             printf("%u-%u-%u-", node->keys[i], node->is_leaf, node->num_keys);
-            printf("%p", node->pointers[i + 1]);
+            // printf("%p", node->pointers[i + 1]);
+            printf("%p", node->parent);
 #else
             printf("%u", node->keys[i]);
 #endif
