@@ -5,7 +5,7 @@
 #include "bptree.h"
 #include "util.h"
 
-#define MAX_CHILDREN 3
+#define MAX_CHILDREN 200
 #define MIN_CHILDREN (MAX_CHILDREN + 1) / 2
 #define MAX_KEYS MAX_CHILDREN - 1
 
@@ -65,6 +65,16 @@ BPTreeNode *search(BPTree *bpt, uint32_t key) {
         node = (BPTreeNode*)node->pointers[idx];
     }
     return node;
+}
+
+uint32_t height(BPTree *bpt) {
+    BPTreeNode *node = bpt->root;
+    uint32_t h = 0;
+    while (!node->is_leaf) {
+        h++;
+        node = (BPTreeNode*)node->pointers[0];
+    }
+    return h;
 }
 
 void internal_insert(uint32_t key, void *pointer, BPTreeNode *node) {
@@ -154,6 +164,8 @@ void internal_insert(uint32_t key, void *pointer, BPTreeNode *node) {
 
 void insert(BPTree *bpt, uint32_t key, void *data) {
     BPTreeNode *leaf = search(bpt, key);
+    uint32_t keyidx = lower_bound(leaf->keys, leaf->num_keys, key);
+    if (keyidx != leaf->num_keys && leaf->keys[keyidx] == key) return;
     internal_insert(key, data, leaf);
     while (bpt->root->parent) {
         bpt->root = bpt->root->parent;

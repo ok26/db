@@ -10,48 +10,15 @@ void print_callback(uint32_t key, void *value) {
 int main() {
     BPTree *bpt = init_bpt();
     void *data = malloc(sizeof(uint32_t));
-    *(uint32_t*)data = 1;
-    insert(bpt, 52, data);
-    print_tree(bpt); printf("\n");
-    data = clone_u32(data);
-    *(uint32_t*)data = 2;
-    insert(bpt, 12, data);
-    print_tree(bpt); printf("\n");
-    data = clone_u32(data);
-    *(uint32_t*)data = 3;
-    insert(bpt, 13, data);
-    print_tree(bpt); printf("\n");
-    data = clone_u32(data);
-    *(uint32_t*)data = 4;
-    insert(bpt, 56, data);
-    print_tree(bpt); printf("\n");
-    data = clone_u32(data);
-    *(uint32_t*)data = 5;
-    insert(bpt, 57, data);
-    print_tree(bpt); printf("\n");
-    data = clone_u32(data);
-    *(uint32_t*)data = 6;
-    insert(bpt, 1, data);
-    print_tree(bpt); printf("\n");
-    data = clone_u32(data);
-    *(uint32_t*)data = 7;
-    insert(bpt, 2, data);
-    print_tree(bpt); printf("\n");
-    data = clone_u32(data);
-    *(uint32_t*)data = 8;
-    insert(bpt, 58, data);
-    print_tree(bpt); printf("\n");
-    data = clone_u32(data);
-    *(uint32_t*)data = 9;
-    insert(bpt, 59, data);
-    print_tree(bpt); printf("\n");
-    data = clone_u32(data);
-    *(uint32_t*)data = 10;
-    insert(bpt, 3, data);
-    print_tree(bpt); printf("\n");
 
-    range_query(bpt, 1, 100, print_callback); printf("\n");
-    range_query(bpt, 6, 57, print_callback);
+    for (int i = 0; i < 10000000; i++) {
+        insert(bpt, 
+            (1103515245ULL * (unsigned long long)i + 12345ULL) & 0x7fffffff, 
+            clone_u32(data));
+    }
+
+    range_query(bpt, 0, 100000, print_callback);
+    printf("\n%u\n", height(bpt));
 
     free_bpt(bpt);
 
