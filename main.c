@@ -2,25 +2,27 @@
 #include <stdio.h>
 #include "bptree.h"
 #include "util.h"
+#include "buffer_manager.h"
 
-void print_callback(uint32_t key, void *value) {
-    printf("Key=%u, Value=%u\n", key, *(uint32_t*)value);
+void print_callback(uint32_t key, uint32_t value) {
+    printf("Key=%u, Value=%u\n", key, value);
 }
 
 int main() {
-    BPTree *bpt = init_bpt();
-    void *data = malloc(sizeof(uint32_t));
+    BPTree *bpt = bpt_init();
+    uint32_t data = 12;
 
-    for (int i = 0; i < 10000000; i++) {
-        insert(bpt, 
+    for (int i = 0; i < 1000000; i++) {
+        bpt_insert(bpt, 
             (1103515245ULL * (unsigned long long)i + 12345ULL) & 0x7fffffff, 
-            clone_u32(data));
+            data);
     }
 
-    range_query(bpt, 0, 100000, print_callback);
-    printf("\n%u\n", height(bpt));
+    bpt_range_query(bpt, 0, 100000, print_callback);
+    printf("\n%u\n", bpt_height(bpt));
 
-    free_bpt(bpt);
+    bpt_free(bpt);
+    buffer_manager_free();
 
     return 0;
 }
