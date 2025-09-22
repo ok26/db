@@ -2,9 +2,16 @@
 #include <stdio.h>
 #include "buffer_manager.h"
 #include "bptree.h"
+#include "util.h"
 
 Page *testing[1000024];
 uint32_t test_size = 0;
+
+struct BufferManager {
+    Map *cached_pages;
+    Heap *freed_pages;
+    uint32_t used_space;
+};
 
 Page *buffer_manager_new_page(uint8_t is_leaf) {
     Page *node = malloc(sizeof(Page));
@@ -23,7 +30,7 @@ Page *buffer_manager_get_page(uint32_t page_id) {
 }
 
 void buffer_manager_free() {
-    for (int i = 0; i < test_size; i++) {
+    for (int i = 0; i < test_size - 1; i++) {
         free(testing[i]);
     }
 }

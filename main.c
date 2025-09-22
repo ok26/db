@@ -9,20 +9,25 @@ void print_callback(uint32_t key, uint32_t value) {
 }
 
 int main() {
-    BPTree *bpt = bpt_init();
-    uint32_t data = 12;
+    Map *m = rbt_init();
 
-    for (int i = 0; i < 1000000; i++) {
-        bpt_insert(bpt, 
-            (1103515245ULL * (unsigned long long)i + 12345ULL) & 0x7fffffff, 
-            data);
+    uint32_t *v = malloc(sizeof(uint32_t));
+    for (int i = 0; i < 100; i++) {
+        uint32_t key = (1103515245ULL * (unsigned long long)i + 12345ULL) & 0x7fffffff;
+        *v = key;
+        rbt_insert(m, key, (void*)v);
+        void *vg = rbt_get(m, key);
+        if (!vg) {
+            printf("Could not retrieve key at iteration: {%d}\n", i);
+        }
+        else {
+            printf("%d\n", *(uint32_t*)vg);
+        }
+        fflush(stdout);
+        v = clone_u32(v);
     }
-
-    bpt_range_query(bpt, 0, 100000, print_callback);
-    printf("\n%u\n", bpt_height(bpt));
-
-    bpt_free(bpt);
-    buffer_manager_free();
+    
+    rbt_free(m);
 
     return 0;
 }

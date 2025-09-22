@@ -13,6 +13,8 @@ typedef struct Page {
     uint32_t next_page_id;
 } Page;
 
+
+typedef struct BufferManager BufferManager;
 Page *buffer_manager_new_page(uint8_t is_leaf);
 Page *buffer_manager_get_page(uint32_t page_id);
 void buffer_manager_free();

@@ -16,14 +16,14 @@ struct BPTree {
 
 BPTree *bpt_init() {
     BPTree *bpt = malloc(sizeof(BPTree));
-    Page *root = buffer_manager_new_page(1);
-    bpt->root = root;
+    bpt->root = buffer_manager_new_page(1);
     bpt->parent_stack = stack_init();
     return bpt;
 }
 
 void bpt_free(BPTree *bpt) {
     stack_free(bpt->parent_stack);
+    buffer_manager_free();
     free(bpt);
 }
 
@@ -103,8 +103,7 @@ Page *internal_insert(uint32_t key, uint32_t pointer,
     
     if (node->is_leaf) {
         r_node->next_page_id = node->next_page_id;
-        node->next_page_id = r_node->page_id;
-        
+        node->next_page_id = r_node->page_id;    
     }
     else {
         // Ignore top key, new leftmost-key splits two values
