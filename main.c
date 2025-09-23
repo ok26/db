@@ -1,8 +1,8 @@
 #include <stdlib.h>
 #include <stdio.h>
-#include "bptree.h"
-#include "util.h"
-#include "buffer_manager.h"
+#include "src/bptree.h"
+#include "src/util.h"
+#include "src/buffer_manager.h"
 
 void print_callback(uint32_t key, uint32_t value) {
     printf("Key=%u, Value=%u\n", key, value);

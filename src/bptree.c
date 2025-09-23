@@ -9,6 +9,11 @@
 // Remove comment for full debug
 // #define FULL_DEBUG
 
+
+// BPTrees should share buffermanagers if they manage the same memory
+// In other words the buffermanager should possibly be passed to the
+// bpt initializer
+
 struct BPTree {
     Page *root;
     Stack *parent_stack;
@@ -52,7 +57,7 @@ Page *internal_insert(uint32_t key, uint32_t pointer,
     Page *node, Stack *parent_stack) {
 
     // Insert into node
-    for (int i = 0; i <= node->num_keys; i++) {
+    for (uint32_t i = 0; i <= node->num_keys; i++) {
         
         if (i == node->num_keys) {
             node->keys[node->num_keys] = key;
@@ -131,7 +136,11 @@ Page *internal_insert(uint32_t key, uint32_t pointer,
 void bpt_insert(BPTree *bpt, uint32_t key, uint32_t data) {
     Page *leaf = search(bpt, key);
     uint32_t keyidx = lower_bound(leaf->keys, leaf->num_keys, key);
-    if (keyidx != leaf->num_keys && leaf->keys[keyidx] == key) return;
+    if (keyidx != leaf->num_keys && leaf->keys[keyidx] == key) {
+        // Overwrite old value
+        leaf->pointers[keyidx + 1] = data;
+        return;
+    }
 
     Page *new_root = internal_insert(key, data, leaf, bpt->parent_stack);
     if (new_root) {
@@ -160,7 +169,7 @@ void bpt_range_query(BPTree *bpt, uint32_t key_low, uint32_t key_high,
     Page *leaf = search(bpt, key_low);
 
     while (leaf) {
-        for (int i = 0; i < leaf->num_keys; i++) {
+        for (uint32_t i = 0; i < leaf->num_keys; i++) {
             if (leaf->keys[i] > key_high) return;
         
             if (leaf->keys[i] >= key_low) {
@@ -175,14 +184,14 @@ void bpt_print(BPTree *bpt) {
     if (!bpt->root) return;
 
     Page *queue[1024];
-    int front = 0, back = 0;
+    uint32_t front = 0, back = 0;
 
-    int nodes_in_level = 1;
-    int nodes_next_level = 0;
+    uint32_t nodes_in_level = 1;
+    uint32_t nodes_next_level = 0;
 
     queue[back++] = bpt->root;
 
-    int level = 0;
+    uint32_t level = 0;
     printf("L0 ");
     while (front < back) {
         Page *node = queue[front++];

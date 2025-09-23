@@ -30,7 +30,7 @@ Page *buffer_manager_get_page(uint32_t page_id) {
 }
 
 void buffer_manager_free() {
-    for (int i = 0; i < test_size - 1; i++) {
+    for (uint32_t i = 0; i < test_size - 1; i++) {
         free(testing[i]);
     }
 }

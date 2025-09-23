@@ -66,7 +66,7 @@ uint32_t stack_top(Stack *stack) {
     if (!stack_is_empty(stack)) {
         return stack->stack[stack->size - 1];
     }
-    return -1;
+    return 0;
 }
 
 void stack_pop(Stack *stack) {
@@ -250,7 +250,7 @@ void rbt_insert(RBTree *rbt, uint32_t key, void *value) {
 }
 
 void rbt_delete(RBTree *rbt, uint32_t key) {
-
+    return;
 }
 
 void *rbt_get(RBTree *rbt, uint32_t key) {
@@ -274,27 +274,27 @@ struct Heap {
 };
 
 uint8_t greater(uint32_t a, uint32_t b) {
-    return a > b;
-}
-
-uint8_t lesser(uint32_t a, uint32_t b) {
     return a < b;
 }
 
-Heap new_heap(cmpf cmp) {
-    Heap heap;
-    heap.data = malloc(sizeof(uint32_t) * 8);
-    heap.size = 0;
-    heap.resvsize = 8;
-    heap.cmp = cmp;
+uint8_t lesser(uint32_t a, uint32_t b) {
+    return a > b;
+}
+
+Heap *new_heap(cmpf cmp) {
+    Heap *heap = malloc(sizeof(Heap));
+    heap->data = malloc(sizeof(uint32_t) * 8);
+    heap->size = 0;
+    heap->resvsize = 8;
+    heap->cmp = cmp;
     return heap;
 }
 
-Heap new_maxheap() {
+Heap *new_maxheap() {
     return new_heap(greater);
 }
 
-Heap new_minheap() {
+Heap *new_minheap() {
     return new_heap(lesser);
 }
 
@@ -353,7 +353,7 @@ void sift_up(uint32_t *data, uint32_t start, cmpf cmp) {
     }
 }
 
-uint32_t top(Heap *heap) {
+uint32_t heap_top(Heap *heap) {
     if (heap->size == 0) {
         return 0;
     }
@@ -361,7 +361,7 @@ uint32_t top(Heap *heap) {
     return heap->data[0];
 }
 
-void insert(Heap *heap, uint32_t value) {
+void heap_insert(Heap *heap, uint32_t value) {
     if (heap->size == heap->resvsize) {
         heap->resvsize *= 2;
         heap->data = realloc(heap->data, heap->resvsize * sizeof(uint32_t));
@@ -372,9 +372,13 @@ void insert(Heap *heap, uint32_t value) {
     sift_up(heap->data, heap->size - 1, heap->cmp);
 }
 
-void pop(Heap *heap) {
+void heap_pop(Heap *heap) {
+    if (heap_is_empty(heap)) {
+        return;
+    }
+
     heap->size--;
-    if (heap->size == 0) {
+    if (heap_is_empty(heap)) {
         return;
     }
 
@@ -382,14 +386,15 @@ void pop(Heap *heap) {
     sift_down(heap->data, 0, heap->size, heap->cmp);
 }
 
-size_t size(Heap *heap) {
+uint32_t heap_size(Heap *heap) {
     return heap->size;
 }
 
-uint8_t is_empty(Heap *heap) {
+uint8_t heap_is_empty(Heap *heap) {
     return heap->size == 0;
 }
 
-void free_heap(Heap *heap) {
+void heap_free(Heap *heap) {
     free(heap->data);
+    free(heap);
 }
