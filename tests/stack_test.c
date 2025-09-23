@@ -10,7 +10,7 @@ int main() {
     for (int i = 99; i >= 0; i--) {
         uint32_t v = stack_top(stack);
         stack_pop(stack);
-        assert(v == i * i);
+        assert(v == (uint32_t)(i * i));
     }
 
     stack_free(stack);

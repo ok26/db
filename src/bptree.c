@@ -9,26 +9,32 @@
 // Remove comment for full debug
 // #define FULL_DEBUG
 
-
-// BPTrees should share buffermanagers if they manage the same memory
-// In other words the buffermanager should possibly be passed to the
-// bpt initializer
-
+// Does not have ownership of buffer-manager
 struct BPTree {
     Page *root;
     Stack *parent_stack;
+    BufferManager *bm;
 };
 
-BPTree *bpt_init() {
+BPTree *bpt_read(BufferManager *bm, uint32_t root_page_id) {
     BPTree *bpt = malloc(sizeof(BPTree));
-    bpt->root = buffer_manager_new_page(1);
+    bpt->root = buffer_manager_get_page(bm, root_page_id);
+    bpt->parent_stack = stack_init();
+    return bpt;
+}
+
+BPTree *bpt_new(BufferManager *bm) {
+    BPTree *bpt = malloc(sizeof(BPTree));
+    bpt->root = buffer_manager_new_page(bm, 1);
+
+    // TODO: Update the root bpt when we create a new bpt
+
     bpt->parent_stack = stack_init();
     return bpt;
 }
 
 void bpt_free(BPTree *bpt) {
     stack_free(bpt->parent_stack);
-    buffer_manager_free();
     free(bpt);
 }
 
@@ -38,7 +44,7 @@ Page *search(BPTree *bpt, uint32_t key) {
     while (!node->is_leaf) {
         stack_push(bpt->parent_stack, node->page_id);
         uint32_t idx = upper_bound(node->keys, node->num_keys, key);
-        node = buffer_manager_get_page(node->pointers[idx]);
+        node = buffer_manager_get_page(bpt->bm, node->pointers[idx]);
     }
     return node;
 }
@@ -48,12 +54,12 @@ uint32_t bpt_height(BPTree *bpt) {
     uint32_t h = 0;
     while (!node->is_leaf) {
         h++;
-        node = buffer_manager_get_page(node->pointers[0]);
+        node = buffer_manager_get_page(bpt->bm, node->pointers[0]);
     }
     return h;
 }
 
-Page *internal_insert(uint32_t key, uint32_t pointer, 
+Page *internal_insert(BPTree *bpt, uint32_t key, uint32_t pointer, 
     Page *node, Stack *parent_stack) {
 
     // Insert into node
@@ -85,7 +91,8 @@ Page *internal_insert(uint32_t key, uint32_t pointer,
 
     // Split Node
     uint32_t spidx = node->num_keys / 2;
-    Page *r_node = buffer_manager_new_page(node->is_leaf);
+    uint32_t promoted_key = node->keys[spidx];
+    Page *r_node = buffer_manager_new_page(bpt->bm, node->is_leaf);
     
 
     if (node->is_leaf) {
@@ -117,19 +124,18 @@ Page *internal_insert(uint32_t key, uint32_t pointer,
 
     // Split root or insert into parent
     if (stack_is_empty(parent_stack)) {
-        Page *root = buffer_manager_new_page(0);
+        Page *root = buffer_manager_new_page(bpt->bm, 0);
         root->num_keys = 1;
-        root->keys[0] = node->keys[node->num_keys];
+        root->keys[0] = promoted_key;
         root->pointers[0] = node->page_id;
         root->pointers[1] = r_node->page_id;
 
         return root;
     }
     else {
-        uint32_t prom_key = node->keys[node->num_keys];
-        Page *parent = buffer_manager_get_page(stack_top(parent_stack));
+        Page *parent = buffer_manager_get_page(bpt->bm, stack_top(parent_stack));
         stack_pop(parent_stack);
-        return internal_insert(prom_key, r_node->page_id, parent, parent_stack);
+        return internal_insert(bpt, promoted_key, r_node->page_id, parent, parent_stack);
     }    
 }
 
@@ -142,7 +148,7 @@ void bpt_insert(BPTree *bpt, uint32_t key, uint32_t data) {
         return;
     }
 
-    Page *new_root = internal_insert(key, data, leaf, bpt->parent_stack);
+    Page *new_root = internal_insert(bpt, key, data, leaf, bpt->parent_stack);
     if (new_root) {
         bpt->root = new_root;
     }
@@ -176,10 +182,11 @@ void bpt_range_query(BPTree *bpt, uint32_t key_low, uint32_t key_high,
                 callback(leaf->keys[i], leaf->pointers[i + 1]);
             }
         }
-        leaf = buffer_manager_get_page(leaf->next_page_id);
+        leaf = buffer_manager_get_page(bpt->bm, leaf->next_page_id);
     }
 }
 
+// Warning, reads entire tree
 void bpt_print(BPTree *bpt) {
     if (!bpt->root) return;
 
@@ -217,7 +224,7 @@ void bpt_print(BPTree *bpt) {
         // Enqueue children if internal
         if (!node->is_leaf) {
             for (uint32_t i = 0; i <= node->num_keys; i++) {
-                queue[back++] = buffer_manager_get_page(node->pointers[i]);
+                queue[back++] = buffer_manager_get_page(bpt->bm, node->pointers[i]);
                 nodes_next_level++;
             }
         }

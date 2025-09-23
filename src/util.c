@@ -139,17 +139,20 @@ void rbtn_free(RBTreeNode *node) {
 
 struct RBTree {
     RBTreeNode *root;
+    uint32_t size;
 };
 
 RBTree *rbt_init() {
     RBTree *rbt = malloc(sizeof(RBTree));
     rbt->root = NULL;
+    rbt->size = 0;
     return rbt;
 }
 
 RBTreeNode *rbt_search(RBTree *rbt, uint32_t key) {
-    RBTreeNode *node = rbt->root;
+    if (!rbt->root) return NULL;
 
+    RBTreeNode *node = rbt->root;
     while (1) {
         if (key == node->key) {
             return node;
@@ -196,10 +199,11 @@ void rbt_rotate(RBTree *rbt, RBTreeNode *node, uint8_t left_rotation) {
 void rbt_insert(RBTree *rbt, uint32_t key, void *value) {
     if (!rbt->root) {
         rbt->root = rbtn_new_root(key, value);
+        rbt->size = 1;
         return;
     }
 
-    RBTreeNode *parent = rbt_search(rbt, key);
+    RBTreeNode *parent = rbt_search(rbt, key); // Cannot be null as root exists
     if (parent->key == key) {
         // If key already exists, update value
         free(parent->value);
@@ -207,9 +211,11 @@ void rbt_insert(RBTree *rbt, uint32_t key, void *value) {
         return;
     }
 
-    RBTreeNode *node = rbtn_new(key, parent, value);
+    rbt->size++;
 
-    uint8_t left_child = key < node->key;
+    RBTreeNode *node = rbtn_new(key, value, parent);
+
+    uint8_t left_child = key < parent->key;
     if (left_child) parent->left = node;
     else parent->right = node;
 
@@ -250,17 +256,56 @@ void rbt_insert(RBTree *rbt, uint32_t key, void *value) {
 }
 
 void rbt_delete(RBTree *rbt, uint32_t key) {
+    // Remember to decrement rbt->size if removal is successful
     return;
 }
 
 void *rbt_get(RBTree *rbt, uint32_t key) {
     RBTreeNode *node = rbt_search(rbt, key);
-    return key == node->key ? node->value : NULL;
+    return node && key == node->key ? node->value : NULL;
 }
 
 void rbt_free(RBTree *rbt) {
     if (rbt->root) rbtn_free(rbt->root);
     free(rbt);
+}
+
+uint32_t rbt_size(RBTree *rbt) {
+    return rbt->size;
+}
+
+void rbt_print(RBTree *rbt) {
+    if (!rbt->root) return;
+
+    RBTreeNode *queue[1024];
+    uint32_t front = 0, back = 0;
+
+    uint32_t nodes_in_level = 1;
+    uint32_t nodes_next_level = 0;
+
+    queue[back++] = rbt->root;
+
+    while (front < back) {
+        RBTreeNode *node = queue[front++];
+        nodes_in_level--;
+
+        printf("[k%u, f%d, v%p] ", node->key, node->color, node->value);
+
+        if (node->left) {
+            queue[back++] = node->left;
+            nodes_next_level++;
+        }
+        if (node->right) {
+            queue[back++] = node->right;
+            nodes_next_level++;
+        }
+
+        if (nodes_in_level == 0) {
+            printf("\n");
+            nodes_in_level = nodes_next_level;
+            nodes_next_level = 0;
+        }
+    }
 }
 
 
