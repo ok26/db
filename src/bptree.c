@@ -4,7 +4,6 @@
 
 #include "bptree.h"
 #include "util.h"
-#include "buffer_manager.h"
 
 // Remove comment for full debug
 // #define FULL_DEBUG
@@ -25,7 +24,7 @@ BPTree *bpt_read(BufferManager *bm, uint32_t root_page_id) {
 
 BPTree *bpt_new(BufferManager *bm) {
     BPTree *bpt = malloc(sizeof(BPTree));
-    bpt->root = buffer_manager_new_page(bm, 1);
+    bpt->root = buffer_manager_new_page(bm, LEAF);
 
     // TODO: Update the root bpt when we create a new bpt
 
@@ -39,126 +38,163 @@ void bpt_free(BPTree *bpt) {
 }
 
 Page *search(BPTree *bpt, uint32_t key) {
-    Page *node = bpt->root;
+    Page *page = bpt->root;
     stack_clear(bpt->parent_stack);
-    while (!node->is_leaf) {
-        stack_push(bpt->parent_stack, node->page_id);
-        uint32_t idx = upper_bound(node->keys, node->num_keys, key);
-        node = buffer_manager_get_page(bpt->bm, node->pointers[idx]);
+    while (!page->header.is_leaf) {
+        stack_push(bpt->parent_stack, page->header.page_id);
+        InternalPage *internal_page = page->internal;
+        uint32_t idx = upper_bound(internal_page->keys, page->header.num_keys, key);
+        page = buffer_manager_get_page(bpt->bm, internal_page->children[idx]);
     }
-    return node;
+    return page;
 }
 
 uint32_t bpt_height(BPTree *bpt) {
-    Page *node = bpt->root;
+    Page *page = bpt->root;
     uint32_t h = 0;
-    while (!node->is_leaf) {
+    while (!page->header.is_leaf) {
         h++;
-        node = buffer_manager_get_page(bpt->bm, node->pointers[0]);
+        page = buffer_manager_get_page(bpt->bm, page->internal->children[0]);
     }
     return h;
 }
 
-Page *internal_insert(BPTree *bpt, uint32_t key, uint32_t pointer, 
-    Page *node, Stack *parent_stack) {
+void promote_key(BPTree *bpt, uint32_t key, uint32_t left_id, 
+    uint32_t right_id, Stack *parent_stack) {
 
-    // Insert into node
-    for (uint32_t i = 0; i <= node->num_keys; i++) {
-        
-        if (i == node->num_keys) {
-            node->keys[node->num_keys] = key;
-            node->pointers[node->num_keys + 1] = pointer;
-            break;
-        }
-
-        if (node->keys[i] > key) {
-            memmove(&node->keys[i + 1], &node->keys[i],
-                (node->num_keys - i) * sizeof(uint32_t));
-            memmove(&node->pointers[i + 2], &node->pointers[i + 1], 
-                (node->num_keys - i) * sizeof(uint32_t));
-            node->keys[i] = key;
-            node->pointers[i + 1] = pointer;
-            break;
-        }
-    }
-
-    node->num_keys++;
-
-    if (node->num_keys <= MAX_KEYS) {
-        // Return NULL, indicating no new root
-        return NULL;
-    }
-
-    // Split Node
-    uint32_t spidx = node->num_keys / 2;
-    uint32_t promoted_key = node->keys[spidx];
-    Page *r_node = buffer_manager_new_page(bpt->bm, node->is_leaf);
-    
-
-    if (node->is_leaf) {
-        memcpy(&r_node->keys[0], &node->keys[spidx], 
-            (node->num_keys - spidx) * sizeof(uint32_t));
-        memcpy(&r_node->pointers[1], &node->pointers[spidx + 1],
-            (node->num_keys - spidx) * sizeof(uint32_t));
-    }
-    else {
-        memcpy(&r_node->keys[0], &node->keys[spidx + 1],
-            (node->num_keys - spidx - 1) * sizeof(uint32_t));
-        memcpy(&r_node->pointers[0], &node->pointers[spidx + 1],
-            (node->num_keys - spidx) * sizeof(uint32_t));
-    }
-    
-    
-
-    r_node->num_keys = node->num_keys - spidx;
-    node->num_keys = spidx;
-    
-    if (node->is_leaf) {
-        r_node->next_page_id = node->next_page_id;
-        node->next_page_id = r_node->page_id;    
-    }
-    else {
-        // Ignore top key, new leftmost-key splits two values
-        r_node->num_keys--;
-    }
-
-    // Split root or insert into parent
     if (stack_is_empty(parent_stack)) {
-        Page *root = buffer_manager_new_page(bpt->bm, 0);
-        root->num_keys = 1;
-        root->keys[0] = promoted_key;
-        root->pointers[0] = node->page_id;
-        root->pointers[1] = r_node->page_id;
-
-        return root;
+        // Split root
+        Page *new_root = buffer_manager_new_page(bpt->bm, INTERNAL);
+        new_root->header.num_keys = 1;
+        new_root->internal->keys[0] = key;
+        new_root->internal->children[0] = left_id;
+        new_root->internal->children[1] = right_id;
+        bpt->root = new_root;
     }
     else {
+        // Insert into parent
         Page *parent = buffer_manager_get_page(bpt->bm, stack_top(parent_stack));
         stack_pop(parent_stack);
-        return internal_insert(bpt, promoted_key, r_node->page_id, parent, parent_stack);
-    }    
+        internal_insert(bpt, key, right_id, parent, parent_stack);
+    }
 }
 
-void bpt_insert(BPTree *bpt, uint32_t key, uint32_t data) {
-    Page *leaf = search(bpt, key);
-    uint32_t keyidx = lower_bound(leaf->keys, leaf->num_keys, key);
-    if (keyidx != leaf->num_keys && leaf->keys[keyidx] == key) {
-        // Overwrite old value
-        leaf->pointers[keyidx + 1] = data;
+void internal_insert(BPTree *bpt, uint32_t key, uint32_t page_id,
+    Page *page, Stack *parent_stack) {
+
+    // Insert into node
+    for (uint32_t i = 0; i <= page->header.num_keys; i++) {
+        
+        if (i == page->header.num_keys) {
+            page->internal->keys[page->header.num_keys] = key;
+            page->internal->children[page->header.num_keys + 1] = page_id;
+            break;
+        }
+
+        if (page->internal->keys[i] > key) {
+            memmove(&page->internal->keys[i + 1], &page->internal->keys[i],
+                (page->header.num_keys - i) * sizeof(uint32_t));
+            memmove(&page->internal->children[i + 2], &page->internal->children[i + 1],
+                (page->header.num_keys - i) * sizeof(uint32_t));
+            page->internal->keys[i] = key;
+            page->internal->children[i + 1] = page_id;
+            break;
+        }
+    }
+
+    page->header.num_keys++;
+
+    if (page->header.num_keys <= MAX_KEYS) {
         return;
     }
 
-    Page *new_root = internal_insert(bpt, key, data, leaf, bpt->parent_stack);
-    if (new_root) {
-        bpt->root = new_root;
-    }
+    // Split Node
+    uint32_t split_idx = page->header.num_keys / 2;
+    uint32_t promoted_key = page->internal->keys[split_idx];
+    Page *right_page = buffer_manager_new_page(bpt->bm, INTERNAL);    
+
+    memcpy(&right_page->internal->keys[0], &page->internal->keys[split_idx + 1],
+        (page->header.num_keys - split_idx - 1) * sizeof(uint32_t));
+    memcpy(&right_page->internal->children[0], &page->internal->children[split_idx + 1],
+        (page->header.num_keys - split_idx) * sizeof(uint32_t));
+
+    right_page->header.num_keys = page->header.num_keys - split_idx;
+    page->header.num_keys = split_idx;
+    
+    // Ignore top key, new leftmost-key splits two values
+    right_page->header.num_keys--;
+
+    promote_key(bpt, promoted_key, page->header.page_id,
+        right_page->header.page_id, parent_stack);
 }
 
-uint32_t bpt_get(BPTree *bpt, uint32_t key) {
+void leaf_insert(BPTree *bpt, uint32_t key, void *data,
+    size_t size, Page *page, Stack *parent_stack) {
+
+    for (uint32_t i = 0; i <= page->header.num_keys; i++) {
+
+        if (i == page->header.num_keys) {
+            uint64_t rid = buffer_manager_request_slot(size);
+            page->leaf->keys[page->header.num_keys] = key;
+            page->leaf->rids[page->header.num_keys] = rid;
+            break;
+        }
+
+        if (page->leaf->keys[i] > key) {
+            uint64_t rid = buffer_manager_request_slot(size);
+            memmove(&page->leaf->keys[i + 1], &page->leaf->keys[i],
+                (page->header.num_keys - i) * sizeof(uint32_t));
+            memmove(&page->leaf->rids[i + 1], &page->leaf->rids[i], 
+                (page->header.num_keys - i) * sizeof(uint64_t));
+            page->leaf->keys[i] = key;
+            page->leaf->rids[i] = rid;
+            break;
+        }
+    }
+
+    page->header.num_keys++;
+
+    if (page->header.num_keys <= MAX_ENTRIES_LEAF) {
+        return;
+    }
+
+    // Else, split node
+    uint32_t split_idx = page->header.num_keys / 2;
+    uint32_t promoted_key = page->leaf->keys[split_idx];
+    Page *right_leaf = buffer_manager_new_page(bpt->bm, LEAF);
+
+    memcpy(&right_leaf->leaf->keys[0], &page->leaf->keys[split_idx], 
+        (page->header.num_keys - split_idx) * sizeof(uint32_t));
+    memcpy(&right_leaf->leaf->rids[0], &page->leaf->rids[split_idx],
+        (page->header.num_keys - split_idx) * sizeof(uint64_t));
+
+    right_leaf->header.num_keys = page->header.num_keys - split_idx;
+    page->header.num_keys = split_idx;
+    right_leaf->leaf->next_page_id = page->leaf->next_page_id;
+    page->leaf->next_page_id = right_leaf->header.page_id;
+
+    promote_key(bpt, promoted_key, page->header.page_id, 
+        right_leaf->header.page_id, parent_stack);
+}
+
+void bpt_insert(BPTree *bpt, uint32_t key, void *data, size_t size) {
     Page *leaf = search(bpt, key);
-    uint32_t idx = lower_bound(leaf->keys, leaf->num_keys, key);
-    if (idx != leaf->num_keys && leaf->keys[idx] == key) {
-        return leaf->pointers[idx + 1];
+    uint32_t keyidx = lower_bound(leaf->leaf->keys, leaf->header.num_keys, key);
+    if (keyidx != leaf->header.num_keys && leaf->leaf->keys[keyidx] == key) {
+        // Overwrite old value
+        leaf->leaf->rids[keyidx + 1] = buffer_manager_request_slot(size);
+        return;
+    }
+
+    leaf_insert(bpt, key, data, size, leaf, bpt->parent_stack);
+}
+
+// Currently returs rid as a placeholder
+uint64_t bpt_get(BPTree *bpt, uint32_t key) {
+    Page *leaf = search(bpt, key);
+    uint32_t idx = lower_bound(leaf->leaf->keys, leaf->header.num_keys, key);
+    if (idx != leaf->header.num_keys && leaf->leaf->keys[idx] == key) {
+        return leaf->leaf->rids[idx + 1];
     }
     else {
         return 0;
@@ -166,7 +202,7 @@ uint32_t bpt_get(BPTree *bpt, uint32_t key) {
 }
 
 void bpt_range_query(BPTree *bpt, uint32_t key_low, uint32_t key_high, 
-    void (*callback)(uint32_t key, uint32_t value)) {
+    void (*callback)(uint32_t key, uint64_t value)) {
     
     if (key_high < key_low) {
         return;
@@ -175,17 +211,18 @@ void bpt_range_query(BPTree *bpt, uint32_t key_low, uint32_t key_high,
     Page *leaf = search(bpt, key_low);
 
     while (leaf) {
-        for (uint32_t i = 0; i < leaf->num_keys; i++) {
-            if (leaf->keys[i] > key_high) return;
+        for (uint32_t i = 0; i < leaf->header.num_keys; i++) {
+            if (leaf->leaf->keys[i] > key_high) return;
         
-            if (leaf->keys[i] >= key_low) {
-                callback(leaf->keys[i], leaf->pointers[i + 1]);
+            if (leaf->leaf->keys[i] >= key_low) {
+                callback(leaf->leaf->keys[i], leaf->leaf->rids[i]);
             }
         }
-        leaf = buffer_manager_get_page(bpt->bm, leaf->next_page_id);
+        leaf = buffer_manager_get_page(bpt->bm, leaf->leaf->next_page_id);
     }
 }
 
+/*
 // Warning, reads entire tree
 void bpt_print(BPTree *bpt) {
     if (!bpt->root) return;
@@ -209,7 +246,7 @@ void bpt_print(BPTree *bpt) {
 #ifdef FULL_DEBUG
         printf("%p | ", node->pointers[0]);
 #endif
-        for (uint32_t i = 0; i < node->num_keys; i++) {
+        for (uint32_t i = 0; i < node->header.num_keys; i++) {
 #ifdef FULL_DEBUG
             printf("%u-%u-%u-", node->keys[i], node->is_leaf, node->num_keys);
             // printf("%p", node->pointers[i + 1]);
@@ -241,3 +278,4 @@ void bpt_print(BPTree *bpt) {
         }
     }
 }
+*/

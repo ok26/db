@@ -10,13 +10,11 @@ uint32_t pseudo_random(uint32_t v) {
 int main() {
     BPTree *bpt = bpt_init();
 
-    uint64_t expected[50001];
+    uint32_t expected[50001];
 
     for (int i = 0; i <= 50000; i++) {
         uint32_t key = pseudo_random(pseudo_random(pseudo_random(i)));
-        uint32_t value = pseudo_random(key);
-        bpt_insert(bpt, key, value);
-        expected[i] = (uint64_t)key + ((uint64_t)value << 32);
+        bpt_insert(bpt, key, NULL, 0);
     }
 
     assert(bpt_height(bpt) == 2);
