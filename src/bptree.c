@@ -15,6 +15,11 @@ struct BPTree {
     BufferManager *bm;
 };
 
+// Declarations
+void internal_insert(BPTree *bpt, uint32_t key, uint32_t page_id,
+    Page *page, Stack *parent_stack);
+
+
 BPTree *bpt_read(BufferManager *bm, uint32_t root_page_id) {
     BPTree *bpt = malloc(sizeof(BPTree));
     bpt->root = buffer_manager_get_page(bm, root_page_id);
@@ -131,15 +136,13 @@ void internal_insert(BPTree *bpt, uint32_t key, uint32_t page_id,
 void leaf_insert(BPTree *bpt, uint32_t key, void *data,
     size_t size, Page *page, Stack *parent_stack) {
 
-    uint64_t rid = buffer_manager_request_slot(size);
-    uint32_t page_id = page_id_from_rid(rid);
-    uint16_t slot_id = slot_id_from_rid(rid);
+    RID rid = buffer_manager_request_slot(size);
     for (uint32_t i = 0; i <= page->header.num_keys; i++) {
 
         if (i == page->header.num_keys) {
             page->leaf->keys[page->header.num_keys] = key;
-            page->leaf->page_ids[page->header.num_keys] = page_id;
-            page->leaf->slot_ids[page->header.num_keys] = slot_id;
+            page->leaf->page_ids[page->header.num_keys] = rid.page_id;
+            page->leaf->slot_ids[page->header.num_keys] = rid.slot_id;
             break;
         }
 
@@ -151,8 +154,8 @@ void leaf_insert(BPTree *bpt, uint32_t key, void *data,
             memmove(&page->leaf->slot_ids[i + 1], &page->leaf->slot_ids[i], 
                 (page->header.num_keys - i) * sizeof(uint16_t));
             page->leaf->keys[i] = key;
-            page->leaf->page_ids[i] = page_id;
-            page->leaf->slot_ids[i] = slot_id;
+            page->leaf->page_ids[i] = rid.page_id;
+            page->leaf->slot_ids[i] = rid.slot_id;
             break;
         }
     }
@@ -189,29 +192,29 @@ void bpt_insert(BPTree *bpt, uint32_t key, void *data, size_t size) {
     uint32_t keyidx = lower_bound(leaf->leaf->keys, leaf->header.num_keys, key);
     if (keyidx != leaf->header.num_keys && leaf->leaf->keys[keyidx] == key) {
         // Overwrite old value
-        uint64_t rid = buffer_manager_request_slot(size);
-        uint32_t page_id = page_id_from_rid(rid);
-        uint16_t slot_id = slot_id_from_rid(rid);
-        leaf->leaf->page_ids[keyidx] = page_id;
-        leaf->leaf->slot_ids[keyidx] = slot_id;
+        RID rid = buffer_manager_request_slot(size);
+        leaf->leaf->page_ids[keyidx] = rid.page_id;
+        leaf->leaf->slot_ids[keyidx] = rid.slot_id;
         return;
     }
 
     leaf_insert(bpt, key, data, size, leaf, bpt->parent_stack);
 }
 
-// Currently returs RID as a placeholder
+// Currently returs nothing as a placeholder
 uint64_t bpt_get(BPTree *bpt, uint32_t key) {
     Page *leaf = search(bpt, key);
     uint32_t idx = lower_bound(leaf->leaf->keys, leaf->header.num_keys, key);
     if (idx != leaf->header.num_keys && leaf->leaf->keys[idx] == key) {
-        return rid_from_ids(leaf->leaf->page_ids[idx], leaf->leaf->slot_ids[idx]);
+        return 0;
+        // return rid_from_ids(leaf->leaf->page_ids[idx], leaf->leaf->slot_ids[idx]);
     }
     else {
         return 0;
     }
 }
 
+// Currently does nothing as a placeholder
 void bpt_range_query(BPTree *bpt, uint32_t key_low, uint32_t key_high, 
     void (*callback)(uint32_t key, uint64_t value)) {
     
@@ -226,9 +229,9 @@ void bpt_range_query(BPTree *bpt, uint32_t key_low, uint32_t key_high,
             if (leaf->leaf->keys[i] > key_high) return;
         
             if (leaf->leaf->keys[i] >= key_low) {
-                uint64_t rid = rid_from_ids(leaf->leaf->page_ids[i], 
-                    leaf->leaf->slot_ids[i]);
-                callback(leaf->leaf->keys[i], rid);
+                //uint64_t rid = rid_from_ids(leaf->leaf->page_ids[i], 
+                    // leaf->leaf->slot_ids[i]);
+                callback(leaf->leaf->keys[i], 0);
             }
         }
         leaf = buffer_manager_get_page(bpt->bm, leaf->leaf->next_page_id);

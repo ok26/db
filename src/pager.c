@@ -2,6 +2,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 uint16_t bytes_to_u16_be(uint8_t b[2]) {
     return ((uint16_t)b[0] << 8) |

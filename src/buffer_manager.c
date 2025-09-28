@@ -55,8 +55,14 @@ Page *buffer_manager_new_page(BufferManager *bm, uint8_t is_leaf) {
     }
 
     if (is_leaf) {
+        page->leaf = malloc(sizeof(LeafPage));
         page->leaf->next_page_id = 0;
     }
+    else {
+        page->internal = malloc(sizeof(InternalPage));
+    }
+
+    page->header = header;
 
     add_page_to_cache(bm, page);
     return page;
@@ -73,7 +79,7 @@ Page *buffer_manager_get_page(BufferManager *bm, uint32_t page_id) {
         return page;
     }
 
-    page = read_page_from_db(bm, page_id);
+    page = read_page_from_db(bm->db_file_path, page_id);
     if (!page) {
         printf("Invalid page-id: %u\n", page_id);
         return NULL;
@@ -83,10 +89,14 @@ Page *buffer_manager_get_page(BufferManager *bm, uint32_t page_id) {
     return page;
 }
 
-uint64_t buffer_manager_request_slot(size_t size) {
+RID buffer_manager_request_slot(size_t size) {
     // TODO, will find a free slot
 
     // Placeholder
     uint32_t slot_id = 0, page_id = 0;
-    return (uint64_t)page_id + (uint64_t)slot_id << 32ULL;
+    RID rid = {
+        page_id,
+        slot_id
+    };
+    return rid;
 }
