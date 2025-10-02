@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include "util.h"
 
 #define STACK_DEFAULT_SIZE 8
@@ -309,44 +310,48 @@ void rbt_print(RBTree *rbt) {
 }
 
 
+#define HEAP_DEFAULT_SIZE 0x8
 
-typedef uint8_t (*cmpf)(uint32_t, uint32_t);
 struct Heap {
-    uint32_t *data;
+    void *data;
     uint32_t size;
     uint32_t resvsize;
     cmpf cmp;
+    size_t type_size;
 };
 
-uint8_t greater(uint32_t a, uint32_t b) {
-    return a < b;
+uint8_t u32_greater(void *a, void *b) {
+    return *(uint32_t*)a < *(uint32_t*)b;
 }
 
-uint8_t lesser(uint32_t a, uint32_t b) {
-    return a > b;
+uint8_t u32_lesser(void *a, void *b) {
+    return *(uint32_t*)a > *(uint32_t*)b;
 }
 
-Heap *new_heap(cmpf cmp) {
+Heap *new_heap(cmpf cmp, size_t type_size) {
     Heap *heap = malloc(sizeof(Heap));
-    heap->data = malloc(sizeof(uint32_t) * 8);
+    heap->data = malloc(type_size * HEAP_DEFAULT_SIZE);
     heap->size = 0;
-    heap->resvsize = 8;
+    heap->resvsize = HEAP_DEFAULT_SIZE;
     heap->cmp = cmp;
+    heap->type_size = type_size;
     return heap;
 }
 
 Heap *new_maxheap() {
-    return new_heap(greater);
+    return new_heap(u32_greater, sizeof(uint32_t));
 }
 
 Heap *new_minheap() {
-    return new_heap(lesser);
+    return new_heap(u32_lesser, sizeof(uint32_t));
 }
 
-void swap(uint32_t *a, uint32_t *b) {
-    uint32_t tmp = *a;
-    *a = *b;
-    *b = tmp;
+void swap(Heap *heap, void *a, void *b) {
+    void *tmp = malloc(heap->type_size);
+    memcpy(tmp, a, heap->type_size);
+    memcpy(a, b, heap->type_size);
+    memcpy(b, tmp, heap->type_size);
+    free(tmp);
 }
 
 uint32_t ileftchild(uint32_t i) {
@@ -364,17 +369,22 @@ uint32_t iparent(uint32_t i) {
     return (i - 1) / 2;
 }
 
-void sift_down(uint32_t *data, uint32_t start, uint32_t end, cmpf cmp) {
-    uint32_t root = start;
+void *datai(Heap *heap, uint32_t i) {
+    return (void*)(heap->data + i * heap->type_size);
+}
 
+void sift_down(Heap *heap, uint32_t start, uint32_t end) {
+
+    uint32_t root = start;
     while (ileftchild(root) < end) {
         uint32_t child = ileftchild(root);
-        if (child + 1 < end && cmp(data[child], data[child + 1])) {
+        if (child + 1 < end && 
+                heap->cmp(datai(heap, child), datai(heap, child + 1))) {
             child++;
         }
 
-        if (cmp(data[root], data[child])) {
-            swap(&data[root], &data[child]);
+        if (heap->cmp(datai(heap, root), datai(heap, child))) {
+            swap(heap, datai(heap, root), datai(heap, child));
             root = child;
         }
         else {
@@ -383,13 +393,13 @@ void sift_down(uint32_t *data, uint32_t start, uint32_t end, cmpf cmp) {
     }
 }
 
-void sift_up(uint32_t *data, uint32_t start, cmpf cmp) {
+void sift_up(Heap *heap, uint32_t start) {
+    
     uint32_t root = start;
-
     while (root != 0) {
         uint32_t parent = iparent(root);
-        if (!cmp(data[root], data[parent])) {
-            swap(&data[root], &data[parent]);
+        if (!heap->cmp(datai(heap, root), datai(heap, parent))) {
+            swap(heap, datai(heap, root), datai(heap, parent));
             root = parent;
         }
         else {
@@ -398,23 +408,24 @@ void sift_up(uint32_t *data, uint32_t start, cmpf cmp) {
     }
 }
 
-uint32_t heap_top(Heap *heap) {
+void *heap_top(Heap *heap) {
     if (heap->size == 0) {
-        return 0;
+        return NULL;
     }
 
-    return heap->data[0];
+    return datai(heap, 0);
 }
 
-void heap_insert(Heap *heap, uint32_t value) {
+void heap_insert(Heap *heap, void *value) {
     if (heap->size == heap->resvsize) {
         heap->resvsize *= 2;
-        heap->data = realloc(heap->data, heap->resvsize * sizeof(uint32_t));
+        heap->data = realloc(heap->data, heap->resvsize * heap->type_size);
     }
 
-    heap->data[heap->size] = value;
+    void *dst = datai(heap, heap->size);
+    memcpy(dst, value, heap->type_size);
     heap->size++;
-    sift_up(heap->data, heap->size - 1, heap->cmp);
+    sift_up(heap, heap->size - 1);
 }
 
 void heap_pop(Heap *heap) {
@@ -427,8 +438,8 @@ void heap_pop(Heap *heap) {
         return;
     }
 
-    swap(&heap->data[heap->size], &heap->data[0]);
-    sift_down(heap->data, 0, heap->size, heap->cmp);
+    swap(heap, datai(heap, heap->size), datai(heap, 0));
+    sift_down(heap, 0, heap->size);
 }
 
 uint32_t heap_size(Heap *heap) {

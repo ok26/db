@@ -25,10 +25,12 @@ void rbt_print(RBTree *rbt);
 typedef RBTree Map;
 
 typedef struct Heap Heap;
+typedef uint8_t (*cmpf)(void*, void*);
+Heap *new_heap(cmpf cmp, size_t type_size);
 Heap *new_maxheap();
 Heap *new_minheap();
-uint32_t heap_top(Heap *heap);
-void heap_insert(Heap *heap, uint32_t value);
+void *heap_top(Heap *heap);
+void heap_insert(Heap *heap, void *value);
 void heap_pop(Heap *heap);
 uint32_t heap_size(Heap *heap);
 uint8_t heap_is_empty(Heap *heap);

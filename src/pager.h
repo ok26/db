@@ -7,8 +7,11 @@
 #define DATA_PAGE (uint8_t)0x1
 #define OVERFLOW_PAGE (uint8_t)0x2
 
+#define DATA_PAGE_HEADER_SIZE 0x7
+#define SLOT_FLAG_NONE (uint8_t)0x0
 #define SLOT_FLAG_FREE (uint8_t)0x1
 #define SLOT_FLAG_OVERFLOW (uint8_t)0x2
+#define SLOT_FLAG_INVALID (uint8_t)0x80
 
 // Page structure:
 // bpt page
@@ -97,13 +100,18 @@ typedef struct Page {
     union {InternalPage *internal; LeafPage *leaf;};
 } Page;
 
+
+// All offsets start from after the header, in other words
+// offset=x is located at (data + x) and free_space_end
+// is initially PAGE_SIZE - DATA_PAGE_HEADER_SIZE. It follows that
+// records start at (data + free_space_end) and slot_directory at
+// (data)
 typedef struct DataPage {
     uint32_t page_id;
     uint16_t num_slots;
     uint16_t free_space_start;
     uint16_t free_space_end;
-    uint8_t *slot_directory;
-    uint8_t *records;
+    uint8_t *data;
 } DataPage;
 
 // Probably needs length aswell
@@ -111,6 +119,13 @@ typedef struct OverflowPage {
     uint8_t *data;
     uint32_t next_page;
 } OverflowPage;
+
+uint16_t bytes_to_u16_be(uint8_t b[2]);
+uint32_t bytes_to_u32_be(uint8_t b[4]);
+uint64_t bytes_to_u64_be(uint8_t b[8]);
+void u16_to_bytes_be(uint8_t b[2], uint16_t v);
+void u32_to_bytes_be(uint8_t b[4], uint32_t v);
+void u64_to_bytes_be(uint8_t b[8], uint64_t v);
 
 void write_page_to_db(char *db_file_path, void *page, uint8_t page_type);
 void *read_page_from_db(char *db_file_path, uint32_t page_id);
