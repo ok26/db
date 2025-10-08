@@ -2,6 +2,12 @@
 #include <stdio.h>
 #include "../src/buffer_manager.h"
 
+typedef struct TestStruct {
+    uint32_t field1;
+    uint8_t field2;
+    uint16_t field3;
+} TestStruct;
+
 int main() {
     BufferManager *bm = buffer_manager_init("db/test.db");
 
@@ -33,6 +39,18 @@ int main() {
 
     res = buffer_manager_get_page(bm, 2);
     assert(res);
+
+    TestStruct v3 = {
+        28734651,
+        200,
+        12637
+    };
+    RID rid3 = buffer_manager_request_slot(bm, sizeof(TestStruct), &v3);
+    res = buffer_manager_get_data(bm, rid3);
+    assert(res);
+    assert((*(TestStruct*)res).field1 == v3.field1);
+    assert((*(TestStruct*)res).field2 == v3.field2);
+    assert((*(TestStruct*)res).field3 == v3.field3);
 
     buffer_manager_free(bm);
     return 0;
