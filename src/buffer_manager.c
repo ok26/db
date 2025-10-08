@@ -19,6 +19,7 @@ uint8_t free_page_greater(void *a, void *b) {
 
 struct BufferManager {
     Map *cached_pages;
+    Heap *cached_pages_page_ids;
     Heap *available_pages;
     Heap *nonfull_data_pages;
     uint32_t used_space;
@@ -32,14 +33,16 @@ void add_page_to_cache(BufferManager *bm, void *page, uint32_t page_id) {
     }
 
     rbt_insert(bm->cached_pages, page_id, (void*)page);
+    heap_insert(bm->cached_pages_page_ids, (void*)&page_id);
 }
 
 BufferManager *buffer_manager_init(char *db_file_path) {
     BufferManager *bm = malloc(sizeof(BufferManager));
     bm->cached_pages = rbt_init();
+    bm->cached_pages_page_ids = new_minheap();
     bm->available_pages = new_minheap();
     bm->nonfull_data_pages = new_heap(free_page_greater, sizeof(FreeDataPage));
-    bm->used_space = 0;
+    bm->used_space = 1;
     bm->db_file_path = db_file_path;
     return bm;
 }
@@ -48,6 +51,7 @@ void buffer_manager_free(BufferManager *bm) {
     // This will double free lots of data, add a flag to 
     // structs if they should free their own data or not
     rbt_free(bm->cached_pages);
+    heap_free(bm->cached_pages_page_ids);
     heap_free(bm->available_pages);
     heap_free(bm->nonfull_data_pages);
     // free(bm->db_file_path); Passer should handle this
@@ -55,18 +59,22 @@ void buffer_manager_free(BufferManager *bm) {
 }
 
 Page *buffer_manager_new_bpt_page(BufferManager *bm, uint8_t is_leaf) {
+    printf("New bpt-page\n");
     Page *page = malloc(sizeof(Page));
     PageHeader header;
     header.is_leaf = is_leaf;
     header.num_keys = 0;
+    header.page_type = BPT_PAGE;
 
     if (!heap_is_empty(bm->available_pages)) {
+        printf("Found previously freed page\n");
         header.page_id = *(uint32_t*)heap_top(bm->available_pages);
         heap_pop(bm->available_pages);
 
-        // Update the info of freed pages (might be done when writing back to db)
+        // Update the info of freed pages in root (might be done when writing back to db)
     }
     else {
+        printf("Allocating new page with page-id: %u\n", bm->used_space);
         header.page_id = bm->used_space++;
     }
 
@@ -85,6 +93,7 @@ Page *buffer_manager_new_bpt_page(BufferManager *bm, uint8_t is_leaf) {
 }
 
 void *buffer_manager_get_page(BufferManager *bm, uint32_t page_id) {
+    printf("Reading page-id: %u\n", page_id);
     if (page_id == 0) {
         // Page-id 0 indicates NULL-page, page 0 is read with special function
         return NULL;
@@ -92,10 +101,12 @@ void *buffer_manager_get_page(BufferManager *bm, uint32_t page_id) {
     
     void *page = rbt_get(bm->cached_pages, page_id);
     if (page) {
+        printf("Page found in cache\n");
         return page;
     }
 
     page = read_page_from_db(bm->db_file_path, page_id);
+    printf("Page read from db\n");
     if (!page) {
         printf("Invalid page-id: %u\n", page_id);
         return NULL;
@@ -137,10 +148,13 @@ void write_slot_entryi(uint8_t *slot_directory, SlotEntry slot_entry, uint32_t i
 
 // Does not yet handle overflow pages
 RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
+    printf("Requesting new data-slot\n");
     if (!heap_is_empty(bm->nonfull_data_pages)) {
         FreeDataPage free_page = *(FreeDataPage*)heap_top(bm->nonfull_data_pages);
+        printf("Free page exists with page-id: %u\n", free_page.page_id);
 
         if (free_page.free_space >= size + SLOT_ENTRY_SIZE) {
+            printf("Data fits\n");
 
             heap_pop(bm->nonfull_data_pages);
             DataPage *page = buffer_manager_get_page(bm, free_page.page_id);
@@ -154,10 +168,12 @@ RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
                 }
 
                 else if (s.flags & SLOT_FLAG_FREE && s.length >= size) {
+                    printf("Data fits within freed slot\n");
                     s.flags = SLOT_FLAG_NONE;
                     s.length = size;
                     write_slot_entryi(slot_directory, s, i);
                     memcpy((page->data + s.offset), data, size);
+                    printf("Slot entry: (%u, %u, %u)\n", s.offset, s.length, s.flags);
 
                     // Size of free-space kept consistent as a slot was reused
                     heap_insert(bm->nonfull_data_pages, &free_page);
@@ -165,6 +181,7 @@ RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
                     RID rid;
                     rid.page_id = free_page.page_id;
                     rid.slot_id = i;
+                    printf("Data put at rid: (%u, %u)\n", rid.page_id, rid.slot_id);
                     return rid;
                 }
             }
@@ -174,6 +191,7 @@ RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
             s.offset = page->free_space_end - size;
             s.length = size;
             s.flags = SLOT_FLAG_NONE;
+            printf("Slot entry: (%u, %u, %u)\n", s.offset, s.length, s.flags);
             uint16_t slot_id = page->free_space_start / SLOT_ENTRY_SIZE;
             write_slot_entryi(page->data, s, slot_id);
             page->free_space_start += SLOT_ENTRY_SIZE;
@@ -192,12 +210,13 @@ RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
             RID rid;
             rid.page_id = free_page.page_id;
             rid.slot_id = slot_id;
-
+            printf("Data put at rid: (%u, %u)\n", rid.page_id, rid.slot_id);
             return rid;
         }
     }
 
     // Else: Allocate new page
+    printf("No free-page, allocating new data-page instead\n");
     DataPage *page = malloc(sizeof(DataPage));
     if (!heap_is_empty(bm->available_pages)) {
         page->page_id = *(uint32_t*)heap_top(bm->available_pages);
@@ -207,14 +226,16 @@ RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
         page->page_id = bm->used_space++;
     }
 
+    page->page_type = DATA_PAGE;
     page->num_slots = 1;
-    page->free_space_start = DATA_PAGE_HEADER_SIZE;
+    page->free_space_start = 0x0;
     page->free_space_end = PAGE_SIZE - DATA_PAGE_HEADER_SIZE;
     page->data = malloc(sizeof(PAGE_SIZE - DATA_PAGE_HEADER_SIZE));
     SlotEntry s;
     s.offset = page->free_space_end - size;
     s.length = size;
     s.flags = SLOT_FLAG_NONE;
+    printf("Slot entry: (%u, %u, %u)\n", s.offset, s.length, s.flags);
     write_slot_entryi(page->data, s, 0);
     page->free_space_start += SLOT_ENTRY_SIZE;
     memcpy((page->data + s.offset), data, size);
@@ -229,16 +250,36 @@ RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
         heap_insert(bm->nonfull_data_pages, &free_page);
     }
 
+    add_page_to_cache(bm, page, page->page_id);
+
     RID rid;
     rid.page_id = page->page_id;
     rid.slot_id = 0;
+    printf("Data put at rid: (%u, %u)\n", rid.page_id, rid.slot_id);
     return rid;
 }
 
 // Does not yet handle overflow pages
 void *buffer_manager_get_data(BufferManager *bm, RID rid) {
+    printf("Reading data from rid: (%u, %u)\n", rid.page_id, rid.slot_id);
     DataPage *page = buffer_manager_get_page(bm, rid.page_id);
-    SlotEntry s = get_slot_entryi(page->data, rid.slot_id);
+    SlotEntry s = get_slot_entryi(page, rid.slot_id);
+    printf("Slot entry: (%u, %u, %u)\n", s.offset, s.length, s.flags);
     void *data = (page->data + s.offset);
     return data;
+}
+
+// Dumb solution while deletion does not exist
+void buffer_manager_flush_cache(BufferManager *bm) {
+    printf("Flushing cache to db\n");
+    while (!heap_is_empty(bm->cached_pages_page_ids)) {
+        uint32_t page_id = *(uint32_t*)heap_top(bm->cached_pages_page_ids);
+        heap_pop(bm->cached_pages_page_ids);
+        void *page = rbt_get(bm->cached_pages, page_id);
+        write_page_to_db(bm->db_file_path, page);
+    }
+
+    // Dumb
+    rbt_free(bm->cached_pages);
+    bm->cached_pages = rbt_init();
 }

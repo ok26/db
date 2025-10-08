@@ -14,3 +14,4 @@ void *buffer_manager_get_page(BufferManager *bm, uint32_t page_id);
 void buffer_manager_free(BufferManager *bm);
 RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data);
 void *buffer_manager_get_data(BufferManager *bm, RID rid);
+void buffer_manager_flush_cache(BufferManager *bm);

@@ -74,6 +74,7 @@
 // 
 
 typedef struct PageHeader {
+    uint8_t page_type;
     uint32_t page_id;
     uint16_t num_keys;
     uint8_t is_leaf;
@@ -107,6 +108,7 @@ typedef struct Page {
 // records start at (data + free_space_end) and slot_directory at
 // (data)
 typedef struct DataPage {
+    uint8_t page_type;
     uint32_t page_id;
     uint16_t num_slots;
     uint16_t free_space_start;
@@ -127,5 +129,5 @@ void u16_to_bytes_be(uint8_t b[2], uint16_t v);
 void u32_to_bytes_be(uint8_t b[4], uint32_t v);
 void u64_to_bytes_be(uint8_t b[8], uint64_t v);
 
-void write_page_to_db(char *db_file_path, void *page, uint8_t page_type);
+void write_page_to_db(char *db_file_path, void *page);
 void *read_page_from_db(char *db_file_path, uint32_t page_id);

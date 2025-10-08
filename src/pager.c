@@ -88,26 +88,30 @@ void data_page_to_db(DataPage *page, uint8_t buffer[PAGE_SIZE]) {
     return;
 }
 
-void write_page_to_db(char *db_file_path, void *page, uint8_t page_type) {
+void write_page_to_db(char *db_file_path, void *page) {
 
     uint8_t buffer[PAGE_SIZE];
+    // First byte is always the page_type
+    uint32_t page_type = *(uint8_t*)page;
     buffer[0] = page_type;
     uint32_t page_id;
     switch (buffer[0]) {
         case BPT_PAGE:
             Page *bpt_page = page;
             page_id = bpt_page->header.page_id;
+            printf("Writing bpt-page(%u) to db\n", page_id);
             bpt_page_to_db(bpt_page, buffer);
             break;
         
         case DATA_PAGE:
             DataPage *data_page = page;
             page_id = data_page->page_id;
+            printf("Writing data-page(%u) to db\n", page_id);
             data_page_to_db(data_page, buffer);
             break;
         
         default:
-            printf("Invalid page: %p", page);
+            printf("Invalid page: %p\n", page);
             return;
     }
     
@@ -135,6 +139,7 @@ void write_page_to_db(char *db_file_path, void *page, uint8_t page_type) {
 
 Page *get_bpt_page(uint8_t raw_page[PAGE_SIZE], uint32_t page_id) {
     PageHeader header;
+    header.page_type = raw_page[0x0];
     header.is_leaf = raw_page[0x1];
     header.num_keys = bytes_to_u16_be(&raw_page[0x2]);
     header.page_id = page_id;
@@ -182,6 +187,7 @@ Page *get_bpt_page(uint8_t raw_page[PAGE_SIZE], uint32_t page_id) {
 DataPage *get_data_page(uint8_t raw_page[PAGE_SIZE], uint32_t page_id) {
     DataPage *page = malloc(sizeof(DataPage));
     page->page_id = page_id;
+    page->page_type = raw_page[0x0];
     page->num_slots = bytes_to_u16_be(&raw_page[0x1]);
     page->free_space_start = bytes_to_u16_be(&raw_page[0x3]);
     page->free_space_end = bytes_to_u16_be(&raw_page[0x5]);
@@ -217,13 +223,15 @@ void *read_page_from_db(char *db_file_path, uint32_t page_id) {
 
     switch (buffer[0]) {
         case BPT_PAGE:
+            printf("Reading bpt-page(%u) from db\n", page_id);
             return (void*)get_bpt_page(buffer, page_id);
         
         case DATA_PAGE:
+            printf("Reading data-page(%u) from db\n", page_id);
             return (void*)get_data_page(buffer, page_id);
         
         default:
-            printf("Invalid page with id: %u", page_id);
+            printf("Invalid page with id: %u\n", page_id);
             break;
     }
 
