@@ -16,11 +16,13 @@ uint8_t stack_is_empty(Stack *stack);
 
 typedef struct RBTree RBTree;
 RBTree *rbt_init();
-void rbt_insert(RBTree *rbt, uint32_t key, void *value);
-void rbt_delete(RBTree *rbt, uint32_t key);
+void rbt_insert(RBTree *rbt, uint32_t key, void *value, size_t size);
+void rbt_delete(RBTree *rbt, uint32_t key, size_t size);
 void *rbt_get(RBTree *rbt, uint32_t key);
 void rbt_free(RBTree *rbt);
 uint32_t rbt_size(RBTree *rbt);
+void rbt_clear(RBTree *rbt);
+uint8_t rbt_verify_tree(RBTree *rbt);
 void rbt_print(RBTree *rbt);
 
 typedef RBTree Map;

@@ -1,46 +1,80 @@
 #include "../src/bptree.h"
-#include "../src/util.h"
 #include <assert.h>
 #include <stdlib.h>
+#include <stdio.h>
 
-/*
 uint32_t pseudo_random(uint32_t v) {
     return (1103515245ULL * (unsigned long long)v + 12345ULL) & 0x7fffffff;
 }
 
-int main() {
-    BPTree *bpt = bpt_init();
+void test_empty_db() {
+    BufferManager *bm = buffer_manager_init("db/test.db");
+    BPTree *bpt = bpt_new(bm);
 
-    uint32_t expected[50001];
+    assert(bpt_height(bpt) == 1);
 
     for (int i = 0; i <= 50000; i++) {
-        uint32_t key = pseudo_random(pseudo_random(pseudo_random(i)));
-        bpt_insert(bpt, key, NULL, 0);
+        uint32_t key = pseudo_random(i);
+        bpt_insert(bpt, key, &i, sizeof(int));
     }
 
     assert(bpt_height(bpt) == 2);
+    printf("Finished inserting!\n");
 
-    Map *seen = rbt_init();
     for (int i = 50000; i >= 0; i--) {
-        uint32_t v = bpt_get(bpt, expected[i] & 0xffffffff);
-        uint32_t *overwritten_value = rbt_get(seen, expected[i] & 0xffffffff);
-        if (overwritten_value) {
-            assert(v == *overwritten_value);
-        }
-        else {
-            assert(v == (uint32_t)(expected[i] >> 32));
-            uint32_t *written_value = malloc(sizeof(uint32_t));
-            *written_value = v;
-            rbt_insert(seen, expected[i] & 0xffffffff, (void*)written_value);
-        }
+        uint32_t key = pseudo_random(i);
+        uint32_t *v = bpt_get(bpt, key);
+        assert(v);
+        assert(*v == i);
     }
 
-    rbt_free(seen);
+    buffer_manager_flush_cache(bm);
+    assert(bpt_height(bpt) == 2);
+
+    uint32_t fib1 = 0, fib2 = 1;
+    while (fib1 <= 50000) {
+        uint32_t key = pseudo_random(fib1);
+        uint32_t *v = bpt_get(bpt, key);
+        assert(v);
+        assert(*v == fib1);
+        fib2 = fib1 + fib2;
+        fib1 = fib2 - fib1;
+    }
+
+    buffer_manager_free(bm);
     bpt_free(bpt);
-    return 0;
 }
-*/
+
+void test_filled_db() {
+    BufferManager *bm = buffer_manager_init("db/test.db");
+    BPTree *bpt = bpt_read(bm, 4); // In this case page_id 4 will be the root
+
+    assert(bpt_height(bpt) == 2);
+
+    for (int i = 50000; i >= 0; i--) {
+        uint32_t key = pseudo_random(i);
+        uint32_t *v = bpt_get(bpt, key);
+        assert(v);
+        assert(*v == i);
+    }
+
+    uint32_t fib1 = 0, fib2 = 1;
+    while (fib1 <= 50000) {
+        uint32_t key = pseudo_random(fib1);
+        uint32_t *v = bpt_get(bpt, key);
+        assert(v);
+        assert(*v == fib1);
+        fib2 = fib1 + fib2;
+        fib1 = fib2 - fib1;
+    }
+}
 
 int main() {
+
+    // test_filled_db can be used if test_empty_db has been used eariler
+    // buffer_manager_flush_cache is used in test_empty_db either way
+
+    test_empty_db();
+    // test_filled_db();
     return 0;
 }

@@ -109,22 +109,24 @@ struct RBTreeNode {
     RBTreeNode *parent;
 };
 
-RBTreeNode *rbtn_new_root(uint32_t key, void *value) {
+RBTreeNode *rbtn_new_root(uint32_t key, void *value, size_t size) {
     RBTreeNode *root = malloc(sizeof(RBTreeNode));
     root->color = RBTN_RED;
     root->key = key;
-    root->value = value;
+    root->value = malloc(size);
+    memcpy(root->value, value, size);
     root->parent = NULL;
     root->left = NULL;
     root->right = NULL;
     return root;
 }
 
-RBTreeNode *rbtn_new(uint32_t key, void *value, RBTreeNode *parent) {
+RBTreeNode *rbtn_new(uint32_t key, void *value, size_t size, RBTreeNode *parent) {
     RBTreeNode *node = malloc(sizeof(RBTreeNode));
     node->color = RBTN_RED;
     node->key = key;
-    node->value = value;
+    node->value = malloc(size);
+    memcpy(node->value, value, size);
     node->parent = parent;
     node->left = NULL;
     node->right = NULL;
@@ -134,6 +136,11 @@ RBTreeNode *rbtn_new(uint32_t key, void *value, RBTreeNode *parent) {
 void rbtn_free(RBTreeNode *node) {
     if (node->left) rbtn_free(node->left);
     if (node->right) rbtn_free(node->right);
+    free(node->value);
+    free(node);
+}
+
+void rbtn_free_single(RBTreeNode *node) {
     free(node->value);
     free(node);
 }
@@ -197,9 +204,9 @@ void rbt_rotate(RBTree *rbt, RBTreeNode *node, uint8_t left_rotation) {
     }
 }
 
-void rbt_insert(RBTree *rbt, uint32_t key, void *value) {
+void rbt_insert(RBTree *rbt, uint32_t key, void *value, size_t size) {
     if (!rbt->root) {
-        rbt->root = rbtn_new_root(key, value);
+        rbt->root = rbtn_new_root(key, value, size);
         rbt->size = 1;
         return;
     }
@@ -207,14 +214,14 @@ void rbt_insert(RBTree *rbt, uint32_t key, void *value) {
     RBTreeNode *parent = rbt_search(rbt, key); // Cannot be null as root exists
     if (parent->key == key) {
         // If key already exists, update value
-        free(parent->value);
-        parent->value = value;
+        parent->value = realloc(parent->value, size);
+        memcpy(parent->value, value, size);
         return;
     }
 
     rbt->size++;
 
-    RBTreeNode *node = rbtn_new(key, value, parent);
+    RBTreeNode *node = rbtn_new(key, value, size, parent);
 
     uint8_t left_child = key < parent->key;
     if (left_child) parent->left = node;
@@ -256,9 +263,150 @@ void rbt_insert(RBTree *rbt, uint32_t key, void *value) {
     }
 }
 
-void rbt_delete(RBTree *rbt, uint32_t key) {
-    // Remember to decrement rbt->size if removal is successful
-    return;
+// Helper
+void rbt_delete_node(RBTree *rbt, RBTreeNode *node, size_t data_size) {
+    uint8_t child_cnt = (node->left != NULL) + (node->right != NULL);
+    uint8_t node_is_root = !node->parent;
+
+    if (child_cnt == 2) {
+        RBTreeNode *left_most_successor = node->right;
+        while (1) {
+            if (left_most_successor->left)
+                left_most_successor = left_most_successor->left;
+            else
+                break;
+        }
+        // Swap values
+        node->key = left_most_successor->key;
+        memcpy(node->value, left_most_successor->value, data_size);
+        rbt_delete_node(rbt, left_most_successor, data_size);
+        return;
+    }
+
+    if (child_cnt == 1) {
+        RBTreeNode *child = node->left ? node->left : node->right;
+        child->color = RBTN_BLACK;
+        if (node_is_root) {
+            child->parent = NULL;
+            rbt->root = child;
+            rbtn_free_single(node);
+            return;
+        }
+        else {
+            child->parent = node->parent;
+            if (node->parent->left == node) node->parent->left = child;
+            else node->parent->right = child;
+            rbtn_free_single(node);
+            return;
+        }
+    }
+
+    // Otherwise, no children
+    if (node_is_root) {
+        rbtn_free_single(rbt->root);
+        rbt->root = NULL;
+        return;
+    }
+
+    if (node->color == RBTN_RED) {
+        if (node->parent->left == node) node->parent->left = NULL;
+        else node->parent->right = NULL;
+        rbtn_free_single(node);
+        return;
+    }
+
+    // Advanced case: no children and black
+    RBTreeNode *parent = node->parent;
+
+    // Remove node
+    uint8_t left_child = (parent->left == node);
+    rbtn_free_single(node);
+    node = NULL;
+    if (left_child) parent->left = NULL;
+    else parent->right = NULL;
+
+    RBTreeNode *sibling;
+    RBTreeNode *distant_nephew;
+    RBTreeNode *close_nephew;
+
+    uint8_t case_6 = 0;
+    uint8_t case_5 = 0;
+    while (parent) {
+        if (node) left_child = (parent->left == node);
+        sibling = left_child ? parent->right : parent->left;
+        distant_nephew = left_child ? sibling->right : sibling->left;
+        close_nephew = left_child ? sibling->left : sibling->right;
+
+        if (sibling->color == RBTN_RED) {
+            rbt_rotate(rbt, parent, left_child);
+            parent->color = RBTN_RED;
+            sibling->color = RBTN_BLACK;
+            sibling = close_nephew;
+
+            distant_nephew = left_child ? sibling->right : sibling->left;
+            if (distant_nephew && distant_nephew->color == RBTN_RED) {
+                case_6 = 1;
+                break;
+            }
+            close_nephew = left_child ? sibling->left : sibling->right;
+            if (close_nephew && close_nephew->color == RBTN_RED) {
+                case_5 = 1;
+                break;
+            }
+
+            sibling->color = RBTN_RED;
+            parent->color = RBTN_BLACK;
+            break;
+        }
+
+        if (distant_nephew && distant_nephew->color == RBTN_RED) {
+                case_6 = 1;
+                break;
+            }
+        
+        if (close_nephew && close_nephew->color == RBTN_RED) {
+            case_5 = 1;
+            break;
+        }
+
+        if (parent->color == RBTN_RED) {
+			sibling->color = RBTN_RED;
+			parent->color = RBTN_BLACK;
+			break;
+		}
+
+        if (!parent) break;
+
+        sibling->color = RBTN_RED;
+		node = parent;
+        parent = node->parent;
+    }
+
+    if (case_6) {
+        rbt_rotate(rbt, sibling, !left_child);
+        sibling->color = RBTN_RED;
+        close_nephew->color = RBTN_BLACK;
+        distant_nephew = sibling;
+        sibling = close_nephew;
+    }
+    
+    if (case_6 || case_5) {
+        rbt_rotate(rbt, parent, left_child);
+        sibling->color = parent->color; 
+        parent->color = RBTN_BLACK;  
+        distant_nephew->color = RBTN_BLACK;  
+    }
+}
+
+void rbt_delete(RBTree *rbt, uint32_t key, size_t size) {
+    RBTreeNode *node = rbt_search(rbt, key);
+    if (!node || node->key != key) {
+        printf("Node not found\n");
+        return;
+    }
+
+    rbt->size--;
+    rbt_delete_node(rbt, node, size);
 }
 
 void *rbt_get(RBTree *rbt, uint32_t key) {
@@ -273,6 +421,31 @@ void rbt_free(RBTree *rbt) {
 
 uint32_t rbt_size(RBTree *rbt) {
     return rbt->size;
+}
+
+void rbt_clear(RBTree *rbt) {
+    if (rbt->root) rbtn_free(rbt->root);
+    rbt->root = NULL;
+    rbt->size = 0;
+}
+
+uint8_t rbt_verify_dfs(RBTree *rbt, RBTreeNode *node) {
+    if (!node) return 1;
+    if (node->parent && node->parent->color == RBTN_RED 
+        && node->color == RBTN_RED) return 255;
+    uint8_t black_cnt_left = rbt_verify_dfs(rbt, node->left);
+    uint8_t black_cnt_right = rbt_verify_dfs(rbt, node->right);
+    if (black_cnt_left == 255 || black_cnt_right == 255 || 
+            black_cnt_left != black_cnt_right) {    
+        return -1;
+    }
+    return black_cnt_left;
+}
+
+uint8_t rbt_verify_tree(RBTree *rbt) {
+    uint8_t black_nodes_cnt = rbt_verify_dfs(rbt, rbt->root);
+    if (black_nodes_cnt == 255) return 0;
+    return 1;
 }
 
 void rbt_print(RBTree *rbt) {

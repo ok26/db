@@ -28,6 +28,8 @@ int main() {
 
     Page *page = buffer_manager_new_bpt_page(bm, LEAF);
     assert(page);
+    Page *bpt_res = buffer_manager_get_page(bm, page->header.page_id);
+    assert(bpt_res);
 
     buffer_manager_flush_cache(bm);
     res = buffer_manager_get_data(bm, rid2);
@@ -51,6 +53,8 @@ int main() {
     assert((*(TestStruct*)res).field1 == v3.field1);
     assert((*(TestStruct*)res).field2 == v3.field2);
     assert((*(TestStruct*)res).field3 == v3.field3);
+
+
 
     buffer_manager_free(bm);
     return 0;
