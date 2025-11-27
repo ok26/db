@@ -246,6 +246,135 @@ void bpt_range_query(BPTree *bpt, uint32_t key_low, uint32_t key_high,
     }
 }
 
+// Part of bpt_delete
+void bpt_remove_internal_seperator(BPTree *bpt, uint32_t seperator, 
+    Page *node) {
+    
+    InternalPage *internal = node->internal;
+    PageHeader *header = &node->header;
+    uint32_t keyidx = lower_bound(internal->keys, header->num_keys, seperator);
+    if (keyidx == header->num_keys || internal->keys[keyidx] != seperator) {
+        // Should be unreachable
+        printf("DEBUG: unreachable cannot find seperator\n");
+        return;
+    }
+
+    memmove(&internal->keys[keyidx], &internal->keys[keyidx + 1], 
+        (header->num_keys - (keyidx + 1)) * sizeof(uint32_t));
+    memmove(&internal->children[keyidx + 1], &internal->children[keyidx + 2],
+        (header->num_keys - (keyidx + 1)) * sizeof(uint32_t));
+    header->num_keys--;
+
+    // Every interal node has (num_keys + 1) children
+    if (header->num_keys + 1 >= MIN_CHILDREN) {
+        return;
+    }
+
+    if (stack_is_empty(bpt->parent_stack)) {
+        if (header->num_keys == 0) {
+            // Decrease height
+            Page *new_root = buffer_manager_get_page(bpt->bm, 
+                internal->children[0]);
+            buffer_manager_free_page(bpt->bm, node);
+            bpt->root = new_root;
+        }
+        return;
+    }
+
+    // Borrow
+    Page *parent = buffer_manager_get_page(bpt->bm, 
+        stack_top(bpt->parent_stack));
+
+    uint32_t left_sibling_idx = lower_bound(parent->internal->keys,
+        parent->header.num_keys, internal->keys[0]);
+    uint32_t left_sibling_page_id = parent->internal->children[left_sibling_idx];
+    Page *left_sibling;
+    if (left_sibling_page_id == header->page_id) {
+        left_sibling = NULL;
+    }
+    else {
+        left_sibling = buffer_manager_get_page(bpt->bm, left_sibling_page_id);
+    }
+
+    if (left_sibling && left_sibling->header.num_keys + 1 > MIN_CHILDREN) {
+        uint32_t borrow_idx_child = left_sibling->header.num_keys - 1;
+        uint32_t borrowed_child_page_id = 
+            left_sibling->internal->children[borrow_idx_child];
+        left_sibling->header.num_keys--;
+        
+        // New key is leftmost key of leftmost child of "node"
+        Page *left_most_child = buffer_manager_get_page(bpt->bm, internal->keys[0]);
+        uint32_t new_key;
+        if (left_most_child->header.is_leaf)
+            new_key = left_most_child->leaf->keys[0];
+        else 
+            new_key = left_most_child->internal->keys[0];
+
+        memmove(&internal->keys[1], &internal->keys[0],
+            header->num_keys * sizeof(uint32_t));
+        memmove(&internal->children[1], &internal->children[0],
+            (header->num_keys + 1) * sizeof(uint32_t));
+        internal->keys[0] = new_key;
+        internal->children[0] = borrowed_child_page_id;
+        header->num_keys++;
+        bpt_update_seperators(bpt, internal->keys[0], internal->keys[1]);
+        return;
+    }
+
+    uint32_t right_sibling_idx;
+    Page *right_sibling = NULL;
+    if (!left_sibling) right_sibling_idx = left_sibling_idx + 1;
+    else right_sibling_idx = left_sibling_idx + 2;
+
+    if (right_sibling_idx < parent->header.num_keys + 1) {
+        uint32_t right_sibling_page_id = parent->internal->children[right_sibling_idx];
+        Page *right_sibling = buffer_manager_get_page(bpt->bm, right_sibling_page_id);
+    }
+
+    if (right_sibling && right_sibling->header.num_keys + 1 > MIN_CHILDREN) {
+        uint32_t borrow_idx_child = 0;
+        uint32_t borrowed_child_page_id = 
+            right_sibling->internal->children[borrow_idx_child];
+        
+        InternalPage *right_internal = right_sibling->internal;
+        uint32_t old_seperator = right_internal->keys[0];
+        memmove(&right_internal->keys[0], &right_internal->keys[1],
+            (right_sibling->header.num_keys - 1) * sizeof(uint32_t));
+        memmove(&right_internal->children[0], &right_internal->children[1],
+            right_sibling->header.num_keys * sizeof(uint32_t));
+        right_sibling->header.num_keys--;
+
+        // New key is leftmost key of borrowed child
+        Page *borrowed_child = 
+            buffer_manager_get_page(bpt->bm, borrowed_child_page_id);
+        uint32_t new_key;
+        if (borrowed_child->header.is_leaf)
+            new_key = borrowed_child->leaf->keys[0];
+        else
+            new_key = borrowed_child->internal->keys[0];
+        
+        internal->keys[header->num_keys] = new_key;
+        internal->children[header->num_keys + 1] = borrowed_child_page_id;
+        header->num_keys++;
+        bpt_update_seperators(bpt, right_internal->keys[0], old_seperator);
+        return;
+    }
+
+    // Merge
+    if (left_sibling) {
+        uint32_t seperator = internal->keys[0];
+        return;
+    }
+
+    if (right_sibling) {
+
+        return;
+    }
+
+    // Unreachable as of the same reason as in bpt_delete
+    assert(0);
+}
+
 // Helper to bpt_delete
 void bpt_update_seperators(BPTree *bpt, uint32_t new_seperator, 
         uint32_t old_seperator) {
@@ -273,82 +402,142 @@ void bpt_delete(BPTree *bpt, uint32_t key) {
     if (!page) return;
     LeafPage *leaf = page->leaf;
     uint32_t keyidx = lower_bound(leaf->keys, page->header.num_keys, key);
-    if (keyidx != page->header.num_keys && leaf->keys[keyidx] == key) {
-        RID rid = {
-            leaf->page_ids[keyidx],
-            leaf->slot_ids[keyidx]
-        };
-        buffer_manager_free_data(bpt->bm, rid);
-        memmove(leaf->keys[keyidx], leaf->keys[keyidx + 1],
-            (page->header.num_keys - (keyidx + 1)) * sizeof(uint32_t));
-        memmove(leaf->page_ids[keyidx], leaf->page_ids[keyidx + 1],
-            (page->header.num_keys - (keyidx + 1)) * sizeof(uint32_t));
-        memmove(leaf->slot_ids[keyidx], leaf->slot_ids[keyidx + 1],
-            (page->header.num_keys - (keyidx + 1)) * sizeof(uint16_t));
-        page->header.num_keys -= 1;
-
-        if (page->header.num_keys >= MIN_ENTRIES_LEAF) {
-            if (keyidx == 0) bpt_update_seperators(bpt, leaf->keys[0], key);
-            return;
-        }
-
-        // Otherwise try borrow (first with left sibling)
-        Page *parent = buffer_manager_get_page(bpt->bm, 
-            stack_top(bpt->parent_stack));
-        
-        uint32_t left_sibling_idx = upper_bound(parent->internal->keys, 
-            parent->header.num_keys, leaf->keys - 1);
-        uint32_t left_sibling_page_id = parent->internal->children[left_sibling_idx];
-        Page *left_sibling = buffer_manager_get_page(bpt->bm, left_sibling_page_id);
-        assert(left_sibling->leaf->next_page_id == page->header.page_id);
-        
-        if (left_sibling->header.num_keys > MIN_ENTRIES_LEAF) {
-            uint32_t borrow_idx = left_sibling->header.num_keys - 1;
-            uint32_t borrowed_key = left_sibling->leaf->keys[borrow_idx];
-            uint32_t borrowed_page_id = left_sibling->leaf->page_ids[borrow_idx];
-            uint32_t borrowed_slot_id = left_sibling->leaf->slot_ids[borrow_idx];
-            left_sibling->header.num_keys--;
-
-            memmove(leaf->keys[1], leaf->keys[0], 
-                page->header.num_keys * sizeof(uint32_t));
-            memmove(leaf->page_ids[1], leaf->page_ids[0], 
-                page->header.num_keys * sizeof(uint32_t));
-            memmove(leaf->slot_ids[1], leaf->slot_ids[0], 
-                page->header.num_keys * sizeof(uint16_t));
-            leaf->keys[0] = borrowed_key;
-            leaf->page_ids[0] = borrowed_page_id;
-            leaf->slot_ids[0] = borrowed_slot_id;
-            page->header.num_keys++;
-            bpt_update_seperators(bpt, leaf->keys[0], leaf->keys[1]);
-            return;
-        }
-
-        // Otherwise the right sibling
-        Page *right_sibling = buffer_manager_get_page(bpt->bm, leaf->next_page_id);
-        if (right_sibling->header.num_keys > MIN_ENTRIES_LEAF) {
-            uint32_t borrow_idx = 0;
-            uint32_t borrowed_key = right_sibling->leaf->keys[borrow_idx];
-            uint32_t borrowed_page_id = right_sibling->leaf->page_ids[borrow_idx];
-            uint32_t borrowed_slot_id = right_sibling->leaf->slot_ids[borrow_idx];
-            memmove(right_sibling->leaf->keys[0], right_sibling->leaf->keys[1],
-                (right_sibling->header.num_keys - 1) * sizeof(uint32_t));
-            memmove(right_sibling->leaf->page_ids[0], right_sibling->leaf->page_ids[1],
-                (right_sibling->header.num_keys - 1) * sizeof(uint32_t));
-            memmove(right_sibling->leaf->slot_ids[0], right_sibling->leaf->slot_ids[1],
-                (right_sibling->header.num_keys - 1) * sizeof(uint16_t));
-            right_sibling->header.num_keys--;
-
-            leaf->keys[page->header.num_keys] = borrowed_key;
-            leaf->page_ids[page->header.num_keys] = borrowed_page_id;
-            leaf->slot_ids[page->header.num_keys] = borrowed_slot_id;
-            page->header.num_keys++;
-            bpt_update_seperators(bpt, right_sibling->leaf->keys[0], borrowed_key);
-            return;
-        }
-
-        // If nothing else works, merge with sibling
-        
+    if (keyidx == page->header.num_keys || leaf->keys[keyidx] != key) {
+        // Value does not exist, skip
+        return;
     }
+
+    RID rid = {
+        leaf->page_ids[keyidx],
+        leaf->slot_ids[keyidx]
+    };
+    buffer_manager_free_data(bpt->bm, rid);
+    memmove(&leaf->keys[keyidx], &leaf->keys[keyidx + 1],
+        (page->header.num_keys - (keyidx + 1)) * sizeof(uint32_t));
+    memmove(&leaf->page_ids[keyidx], &leaf->page_ids[keyidx + 1],
+        (page->header.num_keys - (keyidx + 1)) * sizeof(uint32_t));
+    memmove(&leaf->slot_ids[keyidx], &leaf->slot_ids[keyidx + 1],
+        (page->header.num_keys - (keyidx + 1)) * sizeof(uint16_t));
+    page->header.num_keys -= 1;
+
+    // If leaf is root the boundary does not have to hold
+    if (page->header.num_keys >= MIN_ENTRIES_LEAF || 
+            stack_is_empty(bpt->parent_stack)) {
+        if (keyidx == 0) bpt_update_seperators(bpt, leaf->keys[0], key);
+        return;
+    }
+
+    // Otherwise try borrow (first with left sibling)
+    Page *parent = buffer_manager_get_page(bpt->bm, 
+        stack_top(bpt->parent_stack));
+    
+    uint32_t left_sibling_idx = lower_bound(parent->internal->keys, 
+        parent->header.num_keys, leaf->keys[0]);
+    uint32_t left_sibling_page_id = parent->internal->children[left_sibling_idx];
+    Page *left_sibling;
+    if (left_sibling_page_id == page->header.page_id) {
+        left_sibling = NULL;
+    }
+    else {
+        left_sibling = buffer_manager_get_page(bpt->bm, left_sibling_page_id);
+        assert(left_sibling->leaf->next_page_id == page->header.page_id);
+    }
+    
+    if (left_sibling && left_sibling->header.num_keys > MIN_ENTRIES_LEAF) {
+        uint32_t borrow_idx = left_sibling->header.num_keys - 1;
+        uint32_t borrowed_key = left_sibling->leaf->keys[borrow_idx];
+        uint32_t borrowed_page_id = left_sibling->leaf->page_ids[borrow_idx];
+        uint32_t borrowed_slot_id = left_sibling->leaf->slot_ids[borrow_idx];
+        left_sibling->header.num_keys--;
+
+        memmove(&leaf->keys[1], &leaf->keys[0], 
+            page->header.num_keys * sizeof(uint32_t));
+        memmove(&leaf->page_ids[1], &leaf->page_ids[0], 
+            page->header.num_keys * sizeof(uint32_t));
+        memmove(&leaf->slot_ids[1], &leaf->slot_ids[0], 
+            page->header.num_keys * sizeof(uint16_t));
+        leaf->keys[0] = borrowed_key;
+        leaf->page_ids[0] = borrowed_page_id;
+        leaf->slot_ids[0] = borrowed_slot_id;
+        page->header.num_keys++;
+
+        uint32_t old_seperator = keyidx == 0 ? key : leaf->keys[1];
+        bpt_update_seperators(bpt, leaf->keys[0], old_seperator);
+        return;
+    }
+
+    // Otherwise the right sibling
+    Page *right_sibling = buffer_manager_get_page(bpt->bm, leaf->next_page_id);
+    if (right_sibling && right_sibling->header.num_keys > MIN_ENTRIES_LEAF) {
+        uint32_t borrow_idx = 0;
+        uint32_t borrowed_key = right_sibling->leaf->keys[borrow_idx];
+        uint32_t borrowed_page_id = right_sibling->leaf->page_ids[borrow_idx];
+        uint32_t borrowed_slot_id = right_sibling->leaf->slot_ids[borrow_idx];
+        memmove(&right_sibling->leaf->keys[0], &right_sibling->leaf->keys[1],
+            (right_sibling->header.num_keys - 1) * sizeof(uint32_t));
+        memmove(&right_sibling->leaf->page_ids[0], &right_sibling->leaf->page_ids[1],
+            (right_sibling->header.num_keys - 1) * sizeof(uint32_t));
+        memmove(&right_sibling->leaf->slot_ids[0], &right_sibling->leaf->slot_ids[1],
+            (right_sibling->header.num_keys - 1) * sizeof(uint16_t));
+        right_sibling->header.num_keys--;
+
+        leaf->keys[page->header.num_keys] = borrowed_key;
+        leaf->page_ids[page->header.num_keys] = borrowed_page_id;
+        leaf->slot_ids[page->header.num_keys] = borrowed_slot_id;
+        page->header.num_keys++;
+
+        // FUCK ME
+        uint32_t old_seperator = 
+        bpt_update_seperators(bpt, right_sibling->leaf->keys[0], borrowed_key);
+        return;
+    }
+
+    // If nothing else works, merge with sibling (try left first)
+    if (left_sibling) {
+        uint32_t seperator = leaf->keys[0];
+        LeafPage *left_leaf = left_sibling->leaf;
+        memcpy(&left_leaf->keys[left_sibling->header.num_keys],
+            &leaf->keys[0], page->header.num_keys * sizeof(uint32_t));
+        memcpy(&left_leaf->page_ids[left_sibling->header.num_keys],
+            &leaf->page_ids[0], page->header.num_keys * sizeof(uint32_t));
+        memcpy(&left_leaf->slot_ids[left_sibling->header.num_keys],
+            &leaf->slot_ids[0], page->header.num_keys * sizeof(uint16_t));
+        left_sibling->header.num_keys += page->header.num_keys;
+        left_leaf->next_page_id = leaf->next_page_id;
+        buffer_manager_free_page(bpt->bm, page->header.page_id);
+
+        // Remove seperator from parent
+        Page *parent = stack_top(bpt->parent_stack);
+        stack_pop(bpt->parent_stack);
+        bpt_remove_internal_seperator(bpt, seperator, parent);
+    }
+    
+    // Else right sibling
+    if (right_sibling) {
+        uint32_t seperator = right_sibling->leaf->keys[0];
+        LeafPage *right_leaf = right_sibling->leaf;
+        memcpy(&leaf->keys[page->header.num_keys], &right_leaf->keys[0], 
+            right_sibling->header.num_keys * sizeof(uint32_t));
+        memcpy(&leaf->page_ids[page->header.num_keys], &right_leaf->page_ids[0], 
+            right_sibling->header.num_keys * sizeof(uint32_t));
+        memcpy(&leaf->slot_ids[page->header.num_keys], &right_leaf->slot_ids[0], 
+            right_sibling->header.num_keys * sizeof(uint16_t));
+        page->header.num_keys += right_sibling->header.num_keys;
+        leaf->next_page_id = right_leaf->next_page_id;
+        buffer_manager_free_page(bpt->bm, right_sibling->header.page_id);
+
+        // Remove seperator from parent
+        Page *parent = stack_top(bpt->parent_stack);
+        stack_pop(bpt->parent_stack);
+        bpt_remove_internal_seperator(bpt, seperator, parent);
+    }
+    
+    // Unreachable as the leaf has to have atleast one sibling 
+    // if the tree is valid (Follows as every internal node apart
+    // from the root has to have atleast MIN_CHILDREN children and
+    // if the root ever has only one child, that child becomes the new root)
+    assert(0);
+    return;
 }
 
 /*

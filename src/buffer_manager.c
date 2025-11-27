@@ -53,6 +53,7 @@ BufferManager *buffer_manager_init(char *db_file_path) {
     return bm;
 }
 
+// Pages are not freed lol
 void buffer_manager_free(BufferManager *bm) {
     // This will double free lots of data, add a flag to 
     // structs if they should free their own data or not
@@ -118,6 +119,10 @@ void *buffer_manager_get_page(BufferManager *bm, uint32_t page_id) {
     add_page_to_cache(bm, page, page_id);
     return page;
 }
+
+// void buffer_manager_free_page(BufferManager *bm, uint32_t page_id) {
+
+// }
 
 
 #define SLOT_ENTRY_SIZE 0x5
@@ -254,6 +259,10 @@ RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
     rid.slot_id = 0;
     return rid;
 }
+
+// void buffer_manager_free_data(BufferManager *bm, RID rid) {
+
+// }
 
 // Does not yet handle overflow pages
 void *buffer_manager_get_data(BufferManager *bm, RID rid) {
