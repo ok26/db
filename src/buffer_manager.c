@@ -66,7 +66,7 @@ void buffer_manager_free(BufferManager *bm) {
 }
 
 Page *buffer_manager_new_bpt_page(BufferManager *bm, uint8_t is_leaf) {
-    printf("New bpt-page(%d)\n", bm->used_space);
+    // printf("New bpt-page(%d)\n", bm->used_space);
     Page *page = malloc(sizeof(Page));
     PageHeader header;
     header.is_leaf = is_leaf;
@@ -120,9 +120,9 @@ void *buffer_manager_get_page(BufferManager *bm, uint32_t page_id) {
     return page;
 }
 
-// void buffer_manager_free_page(BufferManager *bm, uint32_t page_id) {
+void buffer_manager_free_page(BufferManager *bm, uint32_t page_id) {
 
-// }
+}
 
 
 #define SLOT_ENTRY_SIZE 0x5
@@ -218,7 +218,7 @@ RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
     }
 
     // Else: Allocate new page
-    printf("New data page (%d)\n", bm->used_space);
+    // printf("New data page (%d)\n", bm->used_space);
     DataPage *page = malloc(sizeof(DataPage));
     if (!heap_is_empty(bm->available_pages)) {
         page->page_id = *(uint32_t*)heap_top(bm->available_pages);
@@ -260,9 +260,9 @@ RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
     return rid;
 }
 
-// void buffer_manager_free_data(BufferManager *bm, RID rid) {
+void buffer_manager_free_data(BufferManager *bm, RID rid) {
 
-// }
+}
 
 // Does not yet handle overflow pages
 void *buffer_manager_get_data(BufferManager *bm, RID rid) {

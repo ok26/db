@@ -93,6 +93,18 @@ uint8_t stack_is_empty(Stack *stack) {
     return stack->size == 0;
 }
 
+Stack *stack_clone(Stack *stack) {
+    Stack *new_stack = malloc(sizeof(Stack));
+    new_stack->size = stack->size;
+    new_stack->resvsize = stack->resvsize;
+    new_stack->stack = malloc(sizeof(uint32_t) * stack->resvsize);
+    // Copy existing stack entries so the clone is a true copy
+    if (stack->size > 0) {
+        memcpy(new_stack->stack, stack->stack, sizeof(uint32_t) * stack->size);
+    }
+    return new_stack;
+}
+
 
 
 

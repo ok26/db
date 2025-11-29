@@ -13,6 +13,7 @@ void stack_pop(Stack *stack);
 void stack_push(Stack *stack, uint32_t value);
 void stack_clear(Stack *stack);
 uint8_t stack_is_empty(Stack *stack);
+Stack *stack_clone(Stack *stack);
 
 typedef struct RBTree RBTree;
 RBTree *rbt_init();
