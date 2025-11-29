@@ -110,7 +110,7 @@ typedef struct Page {
 typedef struct DataPage {
     uint8_t page_type;
     uint32_t page_id;
-    uint16_t num_slots;
+    uint16_t occupied_slots;
     uint16_t free_space_start;
     uint16_t free_space_end;
     uint8_t *data;

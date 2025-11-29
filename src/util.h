@@ -36,6 +36,7 @@ Heap *new_minheap();
 void *heap_top(Heap *heap);
 void heap_insert(Heap *heap, void *value);
 void heap_pop(Heap *heap);
+void *heap_find_sequentially(Heap *heap, uint8_t (*validator)(void*, void*), void *b);
 uint32_t heap_size(Heap *heap);
 uint8_t heap_is_empty(Heap *heap);
 void heap_free(Heap *heap);
