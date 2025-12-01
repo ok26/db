@@ -4,26 +4,20 @@
 
 #include "buffer_manager.h"
 #include "util.h"
+#include "fpih.h"
 
 #define MAX_CACHED_PAGES 256
 
+
 #define MINIMUM_FREE_SPACE 0x4 + SLOT_ENTRY_SIZE
-typedef struct FreeDataPage {
-    uint16_t free_space;
-    uint32_t page_id;
-} FreeDataPage;
 
 typedef struct CachedPage {
     uint32_t page_id;
     uint32_t order;
 } CachedPage;
 
-uint8_t free_page_greater(void *a, void *b) {
-    return ((FreeDataPage*)a)->free_space > ((FreeDataPage*)b)->free_space;
-}
-
 uint8_t cached_page_lesser(void *a, void *b) {
-    return ((CachedPage*)a)->page_id < ((CachedPage*)b)->page_id;
+    return ((CachedPage*)a)->page_id > ((CachedPage*)b)->page_id;
 }
 
 struct BufferManager {
@@ -38,7 +32,7 @@ struct BufferManager {
     Heap *available_pages;
 
     // Heap with elements of type FreeDataPage sorted on FreeDataPage.free_space (greater)
-    Heap *nonfull_data_pages;
+    FreePageHeap *nonfull_data_pages;
 
     uint32_t used_space;
     uint32_t max_order_page_queue;
@@ -76,7 +70,7 @@ BufferManager *buffer_manager_init(char *db_file_path) {
     bm->cached_pages = rbt_init();
     bm->cached_pages_queue = new_heap(cached_page_lesser, sizeof(CachedPage));
     bm->available_pages = new_minheap();
-    bm->nonfull_data_pages = new_heap(free_page_greater, sizeof(FreeDataPage));
+    bm->nonfull_data_pages = new_fph();
     bm->used_space = 1;
     bm->max_order_page_queue = 0;
     bm->db_file_path = db_file_path;
@@ -92,7 +86,7 @@ void buffer_manager_free(BufferManager *bm) {
     rbt_free(bm->cached_pages);
     heap_free(bm->cached_pages_queue);
     heap_free(bm->available_pages);
-    heap_free(bm->nonfull_data_pages);
+    fph_free(bm->nonfull_data_pages);
     // free(bm->db_file_path); Passer should handle this
     free(bm);
 }
@@ -204,13 +198,13 @@ void write_slot_entryi(uint8_t *slot_directory, SlotEntry slot_entry, uint32_t i
 
 // Does not yet handle overflow pages
 RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
-    if (!heap_is_empty(bm->nonfull_data_pages)) {
-        FreeDataPage free_page = *(FreeDataPage*)heap_top(bm->nonfull_data_pages);
+    if (!fph_empty(bm->nonfull_data_pages)) {
+        FreeDataPage free_page = *fph_top(bm->nonfull_data_pages);
         // printf("Found free page(%d)\n", free_page.page_id);
         fflush(stdout);
         if (free_page.free_space >= size + SLOT_ENTRY_SIZE) {
 
-            heap_pop(bm->nonfull_data_pages);
+            fph_pop(bm->nonfull_data_pages);
             DataPage *page = buffer_manager_get_page(bm, free_page.page_id);
 
             for (int i = 0;; i++) {
@@ -229,7 +223,7 @@ RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
                     page->occupied_slots++;
 
                     // Size of free-space kept consistent as a slot was reused
-                    heap_insert(bm->nonfull_data_pages, &free_page);
+                    fph_insert(bm->nonfull_data_pages, &free_page);
 
                     RID rid;
                     rid.page_id = free_page.page_id;
@@ -256,7 +250,7 @@ RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
                 FreeDataPage free_page;
                 free_page.page_id = page->page_id;
                 free_page.free_space = free_space;
-                heap_insert(bm->nonfull_data_pages, &free_page);
+                fph_insert(bm->nonfull_data_pages, &free_page);
             }
 
             RID rid;
@@ -298,7 +292,7 @@ RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
         FreeDataPage free_page;
         free_page.page_id = page->page_id;
         free_page.free_space = free_space;
-        heap_insert(bm->nonfull_data_pages, &free_page);
+        fph_insert(bm->nonfull_data_pages, &free_page);
     }
 
     add_page_to_cache(bm, page, page->page_id);
@@ -307,11 +301,6 @@ RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
     rid.page_id = page->page_id;
     rid.slot_id = 0;
     return rid;
-}
-
-// Helper to find element in heap sequentially
-uint8_t _validator(void *a, void *b) {
-    return ((FreeDataPage*)a)->page_id == *(uint32_t*)b;
 }
 
 void buffer_manager_free_data(BufferManager *bm, RID rid) {
@@ -324,9 +313,11 @@ void buffer_manager_free_data(BufferManager *bm, RID rid) {
         SlotEntry slot_entry = get_slot_entryi(page, rid.slot_id);
         slot_entry.flags = SLOT_FLAG_FREE;
         write_slot_entryi(page->data, slot_entry, rid.slot_id);
-        FreeDataPage *free_page = heap_find_sequentially(bm->nonfull_data_pages, 
-            _validator, rid.page_id);
-        free_page->free_space += slot_entry.length;
+
+        // Remember to move free space start and end
+        
+        // Not neccesarily true: free_page->free_space += slot_entry.length;
+        // Fix fragmentation if greater than 50%?
     }
 }
 

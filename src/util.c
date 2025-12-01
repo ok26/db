@@ -627,18 +627,6 @@ void heap_pop(Heap *heap) {
     sift_down(heap, 0, heap->size);
 }
 
-void *heap_find_sequentially(Heap *heap, uint8_t (*validator)(void*, void*), void *b) {
-    for (int i = 0; i < heap->size; i++) {
-        void *valuei = datai(heap, i);
-        if (validator(valuei, b)) return valuei;
-    }
-    return NULL;
-}
-
-void heap_rebalance_i(Heap *heap, uint32_t i, void *new_entry) {
-
-}
-
 uint32_t heap_size(Heap *heap) {
     return heap->size;
 }
