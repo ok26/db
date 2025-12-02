@@ -6,14 +6,13 @@
 #include "util.h"
 #include "fpih.h"
 
-#define MAX_CACHED_PAGES 256
-
-
+#define MAX_CACHED_PAGES 4096
+#define MAX_ALLOWED_FRAGMENTATION 50 // 50%
 #define MINIMUM_FREE_SPACE 0x4 + SLOT_ENTRY_SIZE
 
 typedef struct CachedPage {
-    uint32_t page_id;
     uint32_t order;
+    uint32_t page_id;
 } CachedPage;
 
 uint8_t cached_page_lesser(void *a, void *b) {
@@ -25,8 +24,11 @@ struct BufferManager {
     // Map of form (key; value): (uint32_t(page_id); **Page(page))
     Map *cached_pages;
 
-    // Heap with elements of type CachedPages sorted on CachedPages.order (lesser)
-    Heap *cached_pages_queue;
+    // Very dumb solution because cannot be bothered right now to
+    // implement general use IndexedHeap even though it wouldnt be 
+    // too difficult, using FreePageHeap with the element FreeDataPage.free_space
+    // as the ordering of the heap, inserting elements as {page_id, INTMAX-cur_order}
+    FreePageHeap *cached_pages_queue;
 
     // Heap with elements of type uint32_t (lesser)
     Heap *available_pages;
@@ -42,11 +44,12 @@ struct BufferManager {
 void add_page_to_cache(BufferManager *bm, void *page, uint32_t page_id) {
 
     if (rbt_size(bm->cached_pages) >= MAX_CACHED_PAGES) {
-        // When cache overflows, write back 20%ish to db
-        uint32_t cnt = MAX_CACHED_PAGES * (uint32_t)80 / (uint32_t)100;
+        printf("Writeback!\n");
+        // When cache overflows, write back 30%ish to db
+        uint32_t cnt = MAX_CACHED_PAGES * (uint32_t)30 / (uint32_t)100;
         for (int i = 0; i < cnt; i++) {
-            CachedPage cached_page = *(CachedPage*)heap_top(bm->cached_pages_queue);
-            heap_pop(bm->cached_pages_queue);
+            CachedPage cached_page = *(CachedPage*)fph_top(bm->cached_pages_queue);
+            fph_pop(bm->cached_pages_queue);
             Page *page = buffer_manager_get_page(bm, cached_page.page_id);
             write_page_to_db(bm->db_file_path, (void*)page);
             buffer_manager_free_page(bm, cached_page.page_id);
@@ -56,10 +59,10 @@ void add_page_to_cache(BufferManager *bm, void *page, uint32_t page_id) {
 
     
     CachedPage p = {
-        page_id,
-        bm->max_order_page_queue++
+        INT32_MAX - (bm->max_order_page_queue++),
+        page_id
     };
-    heap_insert(bm->cached_pages_queue, (void*)&p);
+    fph_insert(bm->cached_pages_queue, (FreeDataPage*)&p);
 
     // Inserts a pointer to the page- as the value
     rbt_insert(bm->cached_pages, page_id, &page, sizeof(void*));
@@ -68,7 +71,7 @@ void add_page_to_cache(BufferManager *bm, void *page, uint32_t page_id) {
 BufferManager *buffer_manager_init(char *db_file_path) {
     BufferManager *bm = malloc(sizeof(BufferManager));
     bm->cached_pages = rbt_init();
-    bm->cached_pages_queue = new_heap(cached_page_lesser, sizeof(CachedPage));
+    bm->cached_pages_queue = new_fph();
     bm->available_pages = new_minheap();
     bm->nonfull_data_pages = new_fph();
     bm->used_space = 1;
@@ -78,13 +81,13 @@ BufferManager *buffer_manager_init(char *db_file_path) {
 }
 
 void buffer_manager_free(BufferManager *bm) {
-    while (!heap_is_empty(bm->cached_pages_queue)) {
-        CachedPage page = *(CachedPage*)heap_top(bm->cached_pages_queue);
-        heap_pop(bm->cached_pages_queue);
+    while (!fph_empty(bm->cached_pages_queue)) {
+        CachedPage page = *(CachedPage*)fph_top(bm->cached_pages_queue);
+        fph_pop(bm->cached_pages_queue);
         buffer_manager_free_page(bm, page.page_id);
     }
     rbt_free(bm->cached_pages);
-    heap_free(bm->cached_pages_queue);
+    fph_free(bm->cached_pages_queue);
     heap_free(bm->available_pages);
     fph_free(bm->nonfull_data_pages);
     // free(bm->db_file_path); Passer should handle this
@@ -153,8 +156,12 @@ void buffer_manager_free_page(BufferManager *bm, uint32_t page_id) {
         DataPage *data_page = page;
         free(data_page->data);
         free(data_page);
-
-        // Update that this page actually is available now
+        
+        fph_remove_by_pageid(bm->nonfull_data_pages, page_id);
+        rbt_delete(bm->cached_pages, page_id, sizeof(void*));
+        fph_remove_by_pageid(bm->cached_pages_queue, page_id);
+        
+        heap_insert(bm->available_pages, (void*)&page_id);
     }
     else if (page_type == BPT_PAGE) {
         Page *bpt_page = page;
@@ -162,7 +169,10 @@ void buffer_manager_free_page(BufferManager *bm, uint32_t page_id) {
         else free(bpt_page->internal);
         free(bpt_page);
 
-        // Update that this page actually is available now
+        rbt_delete(bm->cached_pages, page_id, sizeof(void*));
+        fph_remove_by_pageid(bm->cached_pages_queue, page_id);
+
+        heap_insert(bm->available_pages, (void*)&page_id);
     }
 }
 
@@ -305,19 +315,60 @@ RID buffer_manager_request_slot(BufferManager *bm, size_t size, void *data) {
 
 void buffer_manager_free_data(BufferManager *bm, RID rid) {
     DataPage *page = buffer_manager_get_page(bm, rid.page_id);
+    if (!page) return;
     page->occupied_slots--;
     if (page->occupied_slots == 0) {
         buffer_manager_free_page(bm, rid.page_id);
     }
     else {
         SlotEntry slot_entry = get_slot_entryi(page, rid.slot_id);
+        if (slot_entry.flags == SLOT_FLAG_INVALID) return;
         slot_entry.flags = SLOT_FLAG_FREE;
         write_slot_entryi(page->data, slot_entry, rid.slot_id);
 
-        // Remember to move free space start and end
-        
-        // Not neccesarily true: free_page->free_space += slot_entry.length;
-        // Fix fragmentation if greater than 50%?
+        // Check for fragmented memory
+        uint32_t nonused_memory = 0;
+        uint32_t allocated_memory = 0;
+        for (int i = 0;; i++) {
+            SlotEntry slot = get_slot_entryi(page, i);
+            if (slot.flags == SLOT_FLAG_INVALID) break;
+            if (slot.flags & SLOT_FLAG_FREE) {
+                nonused_memory += slot.length;
+            }
+            allocated_memory += slot.length;
+        }
+
+        // Compact if framentation is greater than MAX_ALLOWED_FRAGMENTATION
+        uint32_t memory_framentation = 100 - (100 * nonused_memory) / allocated_memory;
+        if (memory_framentation > MAX_ALLOWED_FRAGMENTATION) {
+            int current_memory_offset = PAGE_SIZE - DATA_PAGE_HEADER_SIZE;
+            uint8_t *new_data = malloc(PAGE_SIZE - DATA_PAGE_HEADER_SIZE);
+            for (int i = 0;; i++) {
+                SlotEntry slot = get_slot_entryi(page, i);
+                if (slot.flags == SLOT_FLAG_INVALID) break;
+                if (slot.flags & SLOT_FLAG_FREE) continue;
+
+                current_memory_offset -= slot.length;
+                memcpy(new_data + current_memory_offset, page->data + slot.offset,
+                    slot.length);
+                slot.offset = current_memory_offset;
+                
+                write_slot_entryi(page->data, slot, i);
+            }
+            page->free_space_end = current_memory_offset;
+
+            memcpy(page->data + page->free_space_end, new_data + page->free_space_end,
+                PAGE_SIZE - page->free_space_end);
+            free(new_data);
+
+            // Update free-pages
+            fph_remove_by_pageid(bm->nonfull_data_pages, page->page_id);
+            FreeDataPage new_free_page = {
+                page->free_space_end - page->free_space_start,
+                page->page_id
+            };
+            fph_insert(bm->nonfull_data_pages, &new_free_page);
+        }
     }
 }
 
@@ -330,9 +381,9 @@ void *buffer_manager_get_data(BufferManager *bm, RID rid) {
 }
 
 void buffer_manager_flush_cache(BufferManager *bm) {
-    while (!heap_is_empty(bm->cached_pages_queue)) {
-        CachedPage cached_page = *(CachedPage*)heap_top(bm->cached_pages_queue);
-        heap_pop(bm->cached_pages_queue);
+    while (!fph_empty(bm->cached_pages_queue)) {
+        CachedPage cached_page = *(CachedPage*)fph_top(bm->cached_pages_queue);
+        fph_pop(bm->cached_pages_queue);
         void **page = rbt_get(bm->cached_pages, cached_page.page_id);
         write_page_to_db(bm->db_file_path, *page);
         rbt_delete(bm->cached_pages, cached_page.page_id, sizeof(void*));

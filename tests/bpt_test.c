@@ -1,4 +1,5 @@
 #include "../src/bptree.h"
+#include "../src/util.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -123,6 +124,40 @@ void test_with_deletion() {
     bpt_free(bpt);
 }
 
+void test_massive() {
+    // Clear db-file
+    FILE *f = fopen("db/test.db", "w");
+    if (!f) {
+        perror("fopen");
+        return;
+    }
+    fclose(f);
+
+    BufferManager *bm = buffer_manager_init("db/test.db");
+    BPTree *bpt = bpt_new(bm);
+    Map *m = rbt_init();
+
+    for (int i = 0; i < 1000000; i++) {
+        uint32_t key = pseudo_random(i);
+        uint32_t v = i;
+        bpt_insert(bpt, key, &v, sizeof(uint32_t));
+        rbt_insert(m, key, &v, sizeof(uint32_t));
+        if ((i + 1) % 100000 == 0) printf("Debug\n");
+    }
+
+    // Retrieve elements in fibonacci order
+    uint32_t fib1 = 0, fib2 = 1;
+    while (fib1 <= 1000000) {
+        uint32_t key = pseudo_random(fib1);
+        uint32_t *v = bpt_get(bpt, key);
+        assert(v);
+        uint32_t expected_v = *(uint32_t*)rbt_get(m, key);
+        assert(*v == expected_v);
+        fib2 = fib1 + fib2;
+        fib1 = fib2 - fib1;
+    }
+}
+
 int main() {
 
     // test_filled_db can be used if test_empty_db has been used eariler
@@ -130,6 +165,7 @@ int main() {
 
     // test_empty_db();
     // test_filled_db();
-    test_with_deletion();
+    // test_with_deletion();
+    test_massive();
     return 0;
 }

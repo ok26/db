@@ -81,7 +81,7 @@ void bpt_page_to_db(Page *page, uint8_t buffer[PAGE_SIZE]) {
 }
 
 void data_page_to_db(DataPage *page, uint8_t buffer[PAGE_SIZE]) {
-    u16_to_bytes_be(&buffer[0x1], page->num_slots);
+    u16_to_bytes_be(&buffer[0x1], page->occupied_slots);
     u16_to_bytes_be(&buffer[0x3], page->free_space_start);
     u16_to_bytes_be(&buffer[0x5], page->free_space_end);
     memcpy(&buffer[0x7], page->data, PAGE_SIZE - DATA_PAGE_HEADER_SIZE);
@@ -188,7 +188,7 @@ DataPage *get_data_page(uint8_t raw_page[PAGE_SIZE], uint32_t page_id) {
     DataPage *page = malloc(sizeof(DataPage));
     page->page_id = page_id;
     page->page_type = raw_page[0x0];
-    page->num_slots = bytes_to_u16_be(&raw_page[0x1]);
+    page->occupied_slots = bytes_to_u16_be(&raw_page[0x1]);
     page->free_space_start = bytes_to_u16_be(&raw_page[0x3]);
     page->free_space_end = bytes_to_u16_be(&raw_page[0x5]);
 

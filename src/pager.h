@@ -29,10 +29,10 @@
 // 
 // Data page
 // 0x0: 1 byte for type: 0x1 for data page
-// 0x1: 2 bytes for num_slots
+// 0x1: 2 bytes for occupied_slots
 // 0x3: 2 bytes for free_space_start
 // 0x5: 2 bytes for free_space_end
-// 0x7: 5 * num_slots bytes for slot_directory
+// 0x7: 5 * occupied_slots bytes for slot_directory
 // (
 //      Each slot-entry is of the form:
 //      2 bytes for offset
