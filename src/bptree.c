@@ -2,735 +2,889 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-// Debug
-#include <assert.h>
-
 #include "bptree.h"
+#include "record_manager.h"
 #include "util.h"
 
-// Remove comment for full debug
-// #define FULL_DEBUG
+// Trees deeper than this are treated as corrupt, which also protects
+// against cycles. Even with the smallest possible order 2^32 keys only
+// need about 32 levels.
+#define BPT_MAX_HEIGHT 64
 
-// Does not have ownership of buffer-manager
+// The tree only remembers page ids, never Page pointers, as a page can be
+// evicted from memory as soon as it is unpinned.
 struct BPTree {
-    // Very important change this for page_id as it will just be flushed otherwise
-    Page *root;
-    Stack *parent_stack;
     BufferManager *bm;
+    uint32_t root_page_id;
 };
 
-// Declarations
-void internal_insert(BPTree *bpt, uint32_t key, uint32_t page_id,
-    Page *page, Stack *parent_stack);
+// Pages only point downwards, so the way from the root to a leaf is
+// recorded to be able to find parents and siblings when nodes are split
+// or merged. For every internal node on the way the index of the child
+// that was followed is stored.
+typedef struct PathEntry {
+    uint32_t page_id;
+    uint32_t child_idx;
+} PathEntry;
+
+typedef struct Path {
+    PathEntry entries[BPT_MAX_HEIGHT];
+    uint32_t depth;
+} Path;
 
 
-BPTree *bpt_read(BufferManager *bm, uint32_t root_page_id) {
-    BPTree *bpt = malloc(sizeof(BPTree));
-    bpt->root = buffer_manager_get_page(bm, root_page_id);
-    bpt->bm = bm;
-    bpt->parent_stack = stack_init();
-    return bpt;
+// ---- Helpers ----
+
+static DBStatus pin_node(BPTree *bpt, uint32_t page_id, Page **page) {
+    DBStatus rc = buffer_manager_get_page(bpt->bm, page_id, page);
+    if (rc == DB_ERR_INVALID) rc = DB_ERR_CORRUPT;
+    if (rc != DB_OK) return rc;
+
+    if ((*page)->page_type != PAGE_TYPE_BPT) {
+        fprintf(stderr, "bptree: page %u is not a b+tree page\n", page_id);
+        buffer_manager_unpin(bpt->bm, *page);
+        *page = NULL;
+        return DB_ERR_CORRUPT;
+    }
+    return DB_OK;
 }
 
-BPTree *bpt_new(BufferManager *bm) {
-    BPTree *bpt = malloc(sizeof(BPTree));
-    bpt->root = buffer_manager_new_bpt_page(bm, LEAF);
-
-    // TODO: Update the root bpt when we create a new bpt
-
-    bpt->parent_stack = stack_init();
-    bpt->bm = bm;
-    return bpt;
+static void unpin(BPTree *bpt, Page *page) {
+    if (page) buffer_manager_unpin(bpt->bm, page);
 }
 
-void bpt_free(BPTree *bpt) {
-    stack_free(bpt->parent_stack);
+static void mark_dirty(BPTree *bpt, Page *page) {
+    buffer_manager_mark_dirty(bpt->bm, page);
+}
+
+static uint8_t rid_equal(RID a, RID b) {
+    return a.page_id == b.page_id && a.slot_id == b.slot_id;
+}
+
+static void leaf_insert_at(BPTPage *node, uint32_t idx, uint32_t key, RID rid) {
+    LeafPage *leaf = &node->leaf;
+    uint32_t moved = node->num_keys - idx;
+    memmove(&leaf->keys[idx + 1], &leaf->keys[idx], moved * sizeof(uint32_t));
+    memmove(&leaf->rids[idx + 1], &leaf->rids[idx], moved * sizeof(RID));
+    leaf->keys[idx] = key;
+    leaf->rids[idx] = rid;
+    node->num_keys++;
+}
+
+static void leaf_remove_at(BPTPage *node, uint32_t idx) {
+    LeafPage *leaf = &node->leaf;
+    uint32_t moved = node->num_keys - idx - 1;
+    memmove(&leaf->keys[idx], &leaf->keys[idx + 1], moved * sizeof(uint32_t));
+    memmove(&leaf->rids[idx], &leaf->rids[idx + 1], moved * sizeof(RID));
+    node->num_keys--;
+}
+
+// Inserts keys[idx] = key and children[idx + 1] = right_child
+static void internal_insert_at(BPTPage *node, uint32_t idx, uint32_t key,
+        uint32_t right_child) {
+    InternalPage *internal = &node->internal;
+    uint32_t moved = node->num_keys - idx;
+    memmove(&internal->keys[idx + 1], &internal->keys[idx], moved * sizeof(uint32_t));
+    memmove(&internal->children[idx + 2], &internal->children[idx + 1],
+        moved * sizeof(uint32_t));
+    internal->keys[idx] = key;
+    internal->children[idx + 1] = right_child;
+    node->num_keys++;
+}
+
+// Removes keys[idx] and children[idx + 1]
+static void internal_remove_at(BPTPage *node, uint32_t idx) {
+    InternalPage *internal = &node->internal;
+    uint32_t moved = node->num_keys - idx - 1;
+    memmove(&internal->keys[idx], &internal->keys[idx + 1], moved * sizeof(uint32_t));
+    memmove(&internal->children[idx + 1], &internal->children[idx + 2],
+        moved * sizeof(uint32_t));
+    node->num_keys--;
+}
+
+static uint8_t can_lend(const BPTPage *node) {
+    if (node->is_leaf) return node->num_keys > MIN_ENTRIES_LEAF;
+    return node->num_keys + 1 > MIN_CHILDREN;
+}
+
+static uint8_t is_underfull(const BPTPage *node) {
+    if (node->is_leaf) return node->num_keys < MIN_ENTRIES_LEAF;
+    return node->num_keys + 1 < MIN_CHILDREN;
+}
+
+// Walks from the root down to the leaf that should contain key. The leaf is
+// returned pinned.
+static DBStatus find_leaf(BPTree *bpt, uint32_t key, Path *path, Page **leaf) {
+    path->depth = 0;
+    uint32_t page_id = bpt->root_page_id;
+
+    for (;;) {
+        Page *page;
+        DBStatus rc = pin_node(bpt, page_id, &page);
+        if (rc != DB_OK) return rc;
+
+        BPTPage *node = &page->bpt;
+        if (node->is_leaf) {
+            *leaf = page;
+            return DB_OK;
+        }
+
+        if (path->depth == BPT_MAX_HEIGHT) {
+            fprintf(stderr, "bptree: tree is deeper than %d levels\n", BPT_MAX_HEIGHT);
+            unpin(bpt, page);
+            return DB_ERR_CORRUPT;
+        }
+
+        uint32_t idx = upper_bound(node->internal.keys, node->num_keys, key);
+        path->entries[path->depth].page_id = page_id;
+        path->entries[path->depth].child_idx = idx;
+        path->depth++;
+        page_id = node->internal.children[idx];
+        unpin(bpt, page);
+    }
+}
+
+
+// ---- Opening and closing ----
+
+DBStatus bpt_create(BufferManager *bm, BPTree **bpt_out) {
+    *bpt_out = NULL;
+    BPTree *bpt = malloc(sizeof(BPTree));
+    if (!bpt) return DB_ERR_NOMEM;
+
+    Page *root;
+    DBStatus rc = buffer_manager_new_page(bm, PAGE_TYPE_BPT, &root);
+    if (rc != DB_OK) {
+        free(bpt);
+        return rc;
+    }
+
+    // The page is zeroed, only is_leaf has to be set
+    root->bpt.is_leaf = BPT_LEAF;
+    bpt->bm = bm;
+    bpt->root_page_id = root->page_id;
+    buffer_manager_unpin(bm, root);
+
+    *bpt_out = bpt;
+    return DB_OK;
+}
+
+DBStatus bpt_open(BufferManager *bm, uint32_t root_page_id, BPTree **bpt_out) {
+    *bpt_out = NULL;
+
+    Page *root;
+    DBStatus rc = buffer_manager_get_page(bm, root_page_id, &root);
+    if (rc != DB_OK) return rc;
+    uint8_t is_bpt = root->page_type == PAGE_TYPE_BPT;
+    buffer_manager_unpin(bm, root);
+    if (!is_bpt) return DB_ERR_INVALID;
+
+    BPTree *bpt = malloc(sizeof(BPTree));
+    if (!bpt) return DB_ERR_NOMEM;
+    bpt->bm = bm;
+    bpt->root_page_id = root_page_id;
+
+    *bpt_out = bpt;
+    return DB_OK;
+}
+
+void bpt_close(BPTree *bpt) {
     free(bpt);
 }
 
-Page *search(BPTree *bpt, uint32_t key) {
-    Page *page = bpt->root;
-    stack_clear(bpt->parent_stack);
-    while (!page->header.is_leaf) {
-        stack_push(bpt->parent_stack, page->header.page_id);
-        InternalPage *internal_page = page->internal;
-        uint32_t idx = upper_bound(internal_page->keys, page->header.num_keys, key);
-        page = buffer_manager_get_page(bpt->bm, internal_page->children[idx]);
-    }
-    return page;
+uint32_t bpt_root_page_id(BPTree *bpt) {
+    return bpt->root_page_id;
 }
 
-uint32_t bpt_height(BPTree *bpt) {
-    Page *page = bpt->root;
-    if (!page) return 0;
-    uint32_t h = 1;
-    while (!page->header.is_leaf) {
-        h++;
-        page = buffer_manager_get_page(bpt->bm, page->internal->children[0]);
+
+// ---- Lookup ----
+
+DBStatus bpt_get(BPTree *bpt, uint32_t key, void **data, uint32_t *size) {
+    *data = NULL;
+    *size = 0;
+
+    Path path;
+    Page *leaf;
+    DBStatus rc = find_leaf(bpt, key, &path, &leaf);
+    if (rc != DB_OK) return rc;
+
+    BPTPage *node = &leaf->bpt;
+    uint32_t idx = lower_bound(node->leaf.keys, node->num_keys, key);
+    if (idx == node->num_keys || node->leaf.keys[idx] != key) {
+        unpin(bpt, leaf);
+        return DB_NOT_FOUND;
     }
-    return h;
+
+    RID rid = node->leaf.rids[idx];
+    unpin(bpt, leaf);
+
+    rc = record_read(bpt->bm, rid, data, size);
+    // The key exists, so a missing record means the tree is broken
+    if (rc == DB_NOT_FOUND) rc = DB_ERR_CORRUPT;
+    return rc;
 }
 
-void promote_key(BPTree *bpt, uint32_t key, uint32_t left_id, 
-    uint32_t right_id, Stack *parent_stack) {
-
-    if (stack_is_empty(parent_stack)) {
-        // Split root
-        Page *new_root = buffer_manager_new_bpt_page(bpt->bm, INTERNAL);
-        new_root->header.num_keys = 1;
-        new_root->internal->keys[0] = key;
-        new_root->internal->children[0] = left_id;
-        new_root->internal->children[1] = right_id;
-        bpt->root = new_root;
-    }
-    else {
-        // Insert into parent
-        Page *parent = buffer_manager_get_page(bpt->bm, stack_top(parent_stack));
-        stack_pop(parent_stack);
-        internal_insert(bpt, key, right_id, parent, parent_stack);
-    }
-}
-
-void internal_insert(BPTree *bpt, uint32_t key, uint32_t page_id,
-    Page *page, Stack *parent_stack) {
-
-    // Insert into node
-    for (uint32_t i = 0; i <= page->header.num_keys; i++) {
-        
-        if (i == page->header.num_keys) {
-            page->internal->keys[page->header.num_keys] = key;
-            page->internal->children[page->header.num_keys + 1] = page_id;
-            break;
-        }
-
-        if (page->internal->keys[i] > key) {
-            memmove(&page->internal->keys[i + 1], &page->internal->keys[i],
-                (page->header.num_keys - i) * sizeof(uint32_t));
-            memmove(&page->internal->children[i + 2], &page->internal->children[i + 1],
-                (page->header.num_keys - i) * sizeof(uint32_t));
-            page->internal->keys[i] = key;
-            page->internal->children[i + 1] = page_id;
-            break;
-        }
-    }
-
-    page->header.num_keys++;
-
-    if (page->header.num_keys <= MAX_KEYS) {
-        return;
-    }
-
-    // Split Node
-    uint32_t split_idx = page->header.num_keys / 2;
-    uint32_t promoted_key = page->internal->keys[split_idx];
-    Page *right_page = buffer_manager_new_bpt_page(bpt->bm, INTERNAL);    
-
-    memcpy(&right_page->internal->keys[0], &page->internal->keys[split_idx + 1],
-        (page->header.num_keys - split_idx - 1) * sizeof(uint32_t));
-    memcpy(&right_page->internal->children[0], &page->internal->children[split_idx + 1],
-        (page->header.num_keys - split_idx) * sizeof(uint32_t));
-
-    right_page->header.num_keys = page->header.num_keys - split_idx;
-    page->header.num_keys = split_idx;
-    
-    // Ignore top key, new leftmost-key splits two values
-    right_page->header.num_keys--;
-
-    promote_key(bpt, promoted_key, page->header.page_id,
-        right_page->header.page_id, parent_stack);
-}
-
-void leaf_insert(BPTree *bpt, uint32_t key, void *data,
-    size_t size, Page *page, Stack *parent_stack) {
-
-    RID rid = buffer_manager_request_slot(bpt->bm, size, data);
-    for (uint32_t i = 0; i <= page->header.num_keys; i++) {
-
-        if (i == page->header.num_keys) {
-            page->leaf->keys[page->header.num_keys] = key;
-            page->leaf->page_ids[page->header.num_keys] = rid.page_id;
-            page->leaf->slot_ids[page->header.num_keys] = rid.slot_id;
-            break;
-        }
-
-        if (page->leaf->keys[i] > key) {
-            memmove(&page->leaf->keys[i + 1], &page->leaf->keys[i],
-                (page->header.num_keys - i) * sizeof(uint32_t));
-            memmove(&page->leaf->page_ids[i + 1], &page->leaf->page_ids[i], 
-                (page->header.num_keys - i) * sizeof(uint32_t));
-            memmove(&page->leaf->slot_ids[i + 1], &page->leaf->slot_ids[i], 
-                (page->header.num_keys - i) * sizeof(uint16_t));
-            page->leaf->keys[i] = key;
-            page->leaf->page_ids[i] = rid.page_id;
-            page->leaf->slot_ids[i] = rid.slot_id;
-            break;
-        }
-    }
-
-    page->header.num_keys++;
-
-    if (page->header.num_keys <= MAX_ENTRIES_LEAF) {
-        return;
-    }
-
-    // Else, split node
-    uint32_t split_idx = page->header.num_keys / 2;
-    uint32_t promoted_key = page->leaf->keys[split_idx];
-    Page *right_leaf = buffer_manager_new_bpt_page(bpt->bm, LEAF);
-
-    memcpy(&right_leaf->leaf->keys[0], &page->leaf->keys[split_idx], 
-        (page->header.num_keys - split_idx) * sizeof(uint32_t));
-    memcpy(&right_leaf->leaf->page_ids[0], &page->leaf->page_ids[split_idx],
-        (page->header.num_keys - split_idx) * sizeof(uint32_t));
-    memcpy(&right_leaf->leaf->slot_ids[0], &page->leaf->slot_ids[split_idx],
-        (page->header.num_keys - split_idx) * sizeof(uint16_t));
-
-    right_leaf->header.num_keys = page->header.num_keys - split_idx;
-    page->header.num_keys = split_idx;
-    right_leaf->leaf->next_page_id = page->leaf->next_page_id;
-    page->leaf->next_page_id = right_leaf->header.page_id;
-
-    promote_key(bpt, promoted_key, page->header.page_id, 
-        right_leaf->header.page_id, parent_stack);
-}
-
-void bpt_insert(BPTree *bpt, uint32_t key, void *data, size_t size) {
-    Page *leaf = search(bpt, key);
-    uint32_t keyidx = lower_bound(leaf->leaf->keys, leaf->header.num_keys, key);
-    if (keyidx != leaf->header.num_keys && leaf->leaf->keys[keyidx] == key) {
-        // Overwrite old value
-        RID rid = buffer_manager_request_slot(bpt->bm, size, data);
-        leaf->leaf->page_ids[keyidx] = rid.page_id;
-        leaf->leaf->slot_ids[keyidx] = rid.slot_id;
-        return;
-    }
-
-    leaf_insert(bpt, key, data, size, leaf, bpt->parent_stack);
-}
-
-// Currently returs nothing as a placeholder
-void *bpt_get(BPTree *bpt, uint32_t key) {
-    Page *leaf = search(bpt, key);
-    uint32_t idx = lower_bound(leaf->leaf->keys, leaf->header.num_keys, key);
-    if (idx != leaf->header.num_keys && leaf->leaf->keys[idx] == key) {
-        RID rid = {
-            leaf->leaf->page_ids[idx],
-            leaf->leaf->slot_ids[idx]
-        };
-        return buffer_manager_get_data(bpt->bm, rid);
-    }
-    else {
-        return NULL;
-    }
-}
-
-void bpt_range_query(BPTree *bpt, uint32_t key_low, uint32_t key_high, 
-    void (*callback)(uint32_t key, void *data)) {
-    
+DBStatus bpt_range_query(BPTree *bpt, uint32_t key_low, uint32_t key_high,
+        BPTRangeCallback callback, void *ctx) {
     if (key_high < key_low) {
-        return;
+        return DB_OK;
     }
 
-    Page *leaf = search(bpt, key_low);
+    Path path;
+    Page *leaf;
+    DBStatus rc = find_leaf(bpt, key_low, &path, &leaf);
+    if (rc != DB_OK) return rc;
 
-    while (leaf) {
-        for (uint32_t i = 0; i < leaf->header.num_keys; i++) {
-            if (leaf->leaf->keys[i] > key_high) return;
-        
-            if (leaf->leaf->keys[i] >= key_low) {
-                RID rid = {
-                    leaf->leaf->page_ids[i],
-                    leaf->leaf->slot_ids[i]
-                };
-                void *data = buffer_manager_get_data(bpt->bm, rid);
-                callback(leaf->leaf->keys[i], data);
+    uint32_t idx = lower_bound(leaf->bpt.leaf.keys, leaf->bpt.num_keys, key_low);
+    for (;;) {
+        BPTPage *node = &leaf->bpt;
+        for (; idx < node->num_keys; idx++) {
+            uint32_t key = node->leaf.keys[idx];
+            if (key > key_high) {
+                unpin(bpt, leaf);
+                return DB_OK;
+            }
+
+            void *data;
+            uint32_t size;
+            rc = record_read(bpt->bm, node->leaf.rids[idx], &data, &size);
+            if (rc != DB_OK) {
+                unpin(bpt, leaf);
+                return rc == DB_NOT_FOUND ? DB_ERR_CORRUPT : rc;
+            }
+
+            int stop = callback(key, data, size, ctx);
+            free(data);
+            if (stop) {
+                unpin(bpt, leaf);
+                return DB_OK;
             }
         }
-        leaf = buffer_manager_get_page(bpt->bm, leaf->leaf->next_page_id);
+
+        uint32_t next_page_id = node->leaf.next_page_id;
+        unpin(bpt, leaf);
+        if (next_page_id == NULL_PAGE_ID) return DB_OK;
+
+        rc = pin_node(bpt, next_page_id, &leaf);
+        if (rc != DB_OK) return rc;
+        if (!leaf->bpt.is_leaf) {
+            unpin(bpt, leaf);
+            return DB_ERR_CORRUPT;
+        }
+        idx = 0;
     }
 }
 
-// Helper to bpt_delete
-void bpt_update_separators(BPTree *bpt, uint32_t new_separator, 
-        uint32_t old_separator) {
-    
-    uint32_t keyidx = 0;
-    while (keyidx == 0 && !stack_is_empty(bpt->parent_stack)) {
-        Page *parent = buffer_manager_get_page(bpt->bm,
-            stack_top(bpt->parent_stack));
-        stack_pop(bpt->parent_stack);
-        
-        // If child is leftmost child then finished
-        if (old_separator < parent->internal->keys[0]) {
-            return;
-        }
+DBStatus bpt_height(BPTree *bpt, uint32_t *height) {
+    *height = 0;
+    uint32_t page_id = bpt->root_page_id;
+    for (uint32_t h = 1; h <= BPT_MAX_HEIGHT; h++) {
+        Page *page;
+        DBStatus rc = pin_node(bpt, page_id, &page);
+        if (rc != DB_OK) return rc;
 
-        uint32_t pidx = lower_bound(parent->internal->keys,
-            parent->header.num_keys, old_separator);
-        assert(parent->internal->keys[pidx] == old_separator);
-        parent->internal->keys[pidx] = new_separator;
-        keyidx = pidx;
+        uint8_t is_leaf = page->bpt.is_leaf;
+        if (!is_leaf) page_id = page->bpt.internal.children[0];
+        unpin(bpt, page);
+
+        if (is_leaf) {
+            *height = h;
+            return DB_OK;
+        }
     }
+    return DB_ERR_CORRUPT;
 }
 
-// Part of bpt_delete
-void bpt_remove_internal_separator(BPTree *bpt, uint32_t separator, 
-    Page *node) {
-    
-    InternalPage *internal = node->internal;
-    PageHeader *header = &node->header;
-    uint32_t keyidx = lower_bound(internal->keys, header->num_keys, separator);
-    if (keyidx == header->num_keys || internal->keys[keyidx] != separator) {
-        // Should be unreachable
-        printf("DEBUG: unreachable cannot find separator\n");
-        return;
-    }
-
-    memmove(&internal->keys[keyidx], &internal->keys[keyidx + 1], 
-        (header->num_keys - (keyidx + 1)) * sizeof(uint32_t));
-    memmove(&internal->children[keyidx + 1], &internal->children[keyidx + 2],
-        (header->num_keys - (keyidx + 1)) * sizeof(uint32_t));
-    header->num_keys--;
-
-    // Update separators if separator was removed
-    if (keyidx == 0) {
-        // In a valid B+Tree, a non-root internal node must never become empty.
-        // If this invariant is violated it indicates a bug elsewhere. Fail fast.
-        assert(header->num_keys > 0 || stack_is_empty(bpt->parent_stack));
-        if (!stack_is_empty(bpt->parent_stack)) {
-            Stack *temp = stack_clone(bpt->parent_stack);
-            bpt_update_separators(bpt, internal->keys[0], separator);
-            stack_free(bpt->parent_stack);
-            bpt->parent_stack = temp;
-        }
-    }
-
-    // Every interal node has (num_keys + 1) children
-    if (header->num_keys + 1 >= MIN_CHILDREN) {
-        return;
-    }
-
-    if (stack_is_empty(bpt->parent_stack)) {
-        if (header->num_keys == 0) {
-            // Decrease height
-            Page *new_root = buffer_manager_get_page(bpt->bm, 
-                internal->children[0]);
-            buffer_manager_free_page(bpt->bm, node->header.page_id);
-            bpt->root = new_root;
-        }
-        return;
-    }
-
-    // Borrow
-    Page *parent = buffer_manager_get_page(bpt->bm, 
-        stack_top(bpt->parent_stack));
-
-    // Find the child index for this node using upper_bound (same logic as search)
-    uint32_t child_idx = lower_bound(parent->internal->keys,
-        parent->header.num_keys, internal->keys[0]);
-    Page *left_sibling = NULL;
-    if (parent->internal->keys[child_idx] == internal->keys[0]) {
-        uint32_t left_sibling_page_id = parent->internal->children[child_idx];
-        left_sibling = buffer_manager_get_page(bpt->bm, left_sibling_page_id);
-    }
-
-    if (left_sibling && left_sibling->header.num_keys + 1 > MIN_CHILDREN) {
-        // printf("Borrowing from left sibling internal\n");
-        uint32_t borrow_idx_child = left_sibling->header.num_keys - 1;
-        uint32_t borrowed_child_page_id = 
-            left_sibling->internal->children[borrow_idx_child + 1];
-        left_sibling->header.num_keys--;
-        
-        // New separator-key is leftmost key of leftmost child of "node" which was
-        // "ignored before when being leftmost"
-        Page *left_most_child = buffer_manager_get_page(bpt->bm, internal->children[0]);
-        uint32_t new_key;
-        if (left_most_child->header.is_leaf)
-            new_key = left_most_child->leaf->keys[0];
-        else 
-            new_key = left_most_child->internal->keys[0];
-
-        memmove(&internal->keys[1], &internal->keys[0],
-            header->num_keys * sizeof(uint32_t));
-        memmove(&internal->children[1], &internal->children[0],
-            (header->num_keys + 1) * sizeof(uint32_t));
-        internal->keys[0] = new_key;
-        internal->children[0] = borrowed_child_page_id;
-        header->num_keys++;
-        bpt_update_separators(bpt, internal->keys[0], internal->keys[1]);
-        return;
-    }
-
-    uint32_t right_sibling_idx;
-    Page *right_sibling = NULL;
-    // child_idx is the index of the current node in parent's children
-    right_sibling_idx = child_idx + 1;
-
-    if (right_sibling_idx < parent->header.num_keys + 1) {
-        uint32_t right_sibling_page_id = parent->internal->children[right_sibling_idx];
-        right_sibling = buffer_manager_get_page(bpt->bm, right_sibling_page_id);
-    }
-
-    if (right_sibling && right_sibling->header.num_keys + 1 > MIN_CHILDREN) {
-        // printf("Borrowing from right sibling internal\n");
-        uint32_t borrow_idx_child = 0;
-        uint32_t borrowed_child_page_id = 
-            right_sibling->internal->children[borrow_idx_child];
-        
-        InternalPage *right_internal = right_sibling->internal;
-        uint32_t old_separator = right_internal->keys[0];
-        memmove(&right_internal->keys[0], &right_internal->keys[1],
-            (right_sibling->header.num_keys - 1) * sizeof(uint32_t));
-        memmove(&right_internal->children[0], &right_internal->children[1],
-            right_sibling->header.num_keys * sizeof(uint32_t));
-        right_sibling->header.num_keys--;
-        bpt_update_separators(bpt, right_internal->keys[0], old_separator);
-
-        // New key is leftmost key of borrowed child
-        Page *borrowed_child = 
-            buffer_manager_get_page(bpt->bm, borrowed_child_page_id);
-        uint32_t new_key;
-        if (borrowed_child->header.is_leaf)
-            new_key = borrowed_child->leaf->keys[0];
-        else
-            new_key = borrowed_child->internal->keys[0];
-        
-        internal->keys[header->num_keys] = new_key;
-        internal->children[header->num_keys + 1] = borrowed_child_page_id;
-        header->num_keys++;
-        return;
-    }
-
-    // Merge
-    if (left_sibling) {
-        // printf("Merging with left sibling internal\n");
-        uint32_t removed_separator = internal->keys[0];
-        InternalPage *left_internal = left_sibling->internal;
-        memcpy(&left_internal->keys[left_sibling->header.num_keys],
-            &internal->keys[0], node->header.num_keys * sizeof(uint32_t));
-        memcpy(&left_internal->children[left_sibling->header.num_keys + 1],
-            &internal->children[0], (node->header.num_keys + 1) * sizeof(uint32_t));
-        left_sibling->header.num_keys += node->header.num_keys;
-        buffer_manager_free_page(bpt->bm, node->header.page_id);
-
-        // Recursively remove separator from parent
-        Page *parent = buffer_manager_get_page(bpt->bm, stack_top(bpt->parent_stack));
-        stack_pop(bpt->parent_stack);
-        bpt_remove_internal_separator(bpt, removed_separator, parent);
-        return;
-    }
-
-    if (right_sibling) {
-        // printf("Merging with right sibling internal\n");
-        uint32_t removed_separator = right_sibling->internal->keys[0];
-        InternalPage *right_internal = right_sibling->internal;
-        memcpy(&internal->keys[node->header.num_keys], &right_internal->keys[0],
-            right_sibling->header.num_keys * sizeof(uint32_t));
-        memcpy(&internal->children[node->header.num_keys + 1], &right_internal->children[0],
-            (right_sibling->header.num_keys + 1) * sizeof(uint32_t));
-        node->header.num_keys += right_sibling->header.num_keys;
-        buffer_manager_free_page(bpt->bm, right_sibling->header.page_id);
-
-        // Recursively remove separator from parent
-        Page *parent = buffer_manager_get_page(bpt->bm, stack_top(bpt->parent_stack));
-        stack_pop(bpt->parent_stack);
-        bpt_remove_internal_separator(bpt, removed_separator, parent);
-        return;
-    }
-
-    // Unreachable as of the same reason as in bpt_delete
-    printf("DEBUG: Should never reach");
+DBStatus bpt_empty(BPTree *bpt, uint8_t *empty) {
+    Page *root;
+    DBStatus rc = pin_node(bpt, bpt->root_page_id, &root);
+    if (rc != DB_OK) return rc;
+    *empty = root->bpt.is_leaf && root->bpt.num_keys == 0;
+    unpin(bpt, root);
+    return DB_OK;
 }
 
-void bpt_delete(BPTree *bpt, uint32_t key) {
-    Page *page = search(bpt, key);
-    if (!page) return;
-    LeafPage *leaf = page->leaf;
-    uint32_t keyidx = lower_bound(leaf->keys, page->header.num_keys, key);
-    if (keyidx == page->header.num_keys || leaf->keys[keyidx] != key) {
-        // Value does not exist, skip
-        return;
-    }
 
-    RID rid = {
-        leaf->page_ids[keyidx],
-        leaf->slot_ids[keyidx]
-    };
-    buffer_manager_free_data(bpt->bm, rid);
-    memmove(&leaf->keys[keyidx], &leaf->keys[keyidx + 1],
-        (page->header.num_keys - (keyidx + 1)) * sizeof(uint32_t));
-    memmove(&leaf->page_ids[keyidx], &leaf->page_ids[keyidx + 1],
-        (page->header.num_keys - (keyidx + 1)) * sizeof(uint32_t));
-    memmove(&leaf->slot_ids[keyidx], &leaf->slot_ids[keyidx + 1],
-        (page->header.num_keys - (keyidx + 1)) * sizeof(uint16_t));
-    page->header.num_keys -= 1;
-    
-    // Update separators if separator was removed
-    if (keyidx == 0) {
-        // In a valid B+Tree, a non-root leaf must not become empty. If it does,
-        // that indicates a bug elsewhere; fail fast so it can be diagnosed.
-        assert(page->header.num_keys > 0 || stack_is_empty(bpt->parent_stack));
-        if (!stack_is_empty(bpt->parent_stack)) {
-            Stack *temp = stack_clone(bpt->parent_stack);
-            bpt_update_separators(bpt, leaf->keys[0], key);
-            stack_free(bpt->parent_stack);
-            bpt->parent_stack = temp;
-        }
-    }
+// ---- Insertion ----
 
-    // If leaf is root the boundary does not have to hold
-    if (page->header.num_keys >= MIN_ENTRIES_LEAF || 
-            stack_is_empty(bpt->parent_stack)) {
-        return;
-    }
+// Moves the upper half of an overflowing node into a new right sibling.
+// The separator and the new page id have to be inserted into the parent.
+static DBStatus split_node(BPTree *bpt, Page *page, uint32_t *separator,
+        uint32_t *right_page_id) {
+    Page *right_page;
+    DBStatus rc = buffer_manager_new_page(bpt->bm, PAGE_TYPE_BPT, &right_page);
+    if (rc != DB_OK) return rc;
 
-    // Otherwise try borrow (first with left sibling)
-    Page *parent = buffer_manager_get_page(bpt->bm, 
-        stack_top(bpt->parent_stack));
-    
-    // Determine the child index of this leaf, then pick the immediate left sibling
-    uint32_t child_idx = lower_bound(parent->internal->keys,
-        parent->header.num_keys, leaf->keys[0]);
-    Page *left_sibling = NULL;
-    if (parent->internal->keys[child_idx] == leaf->keys[0]) {
-        uint32_t left_sibling_page_id = parent->internal->children[child_idx];
-        left_sibling = buffer_manager_get_page(bpt->bm, left_sibling_page_id);
-        assert(left_sibling->leaf->next_page_id == page->header.page_id);
-    }
-    
-    if (left_sibling && left_sibling->header.num_keys > MIN_ENTRIES_LEAF) {
-        // printf("Borrowing from left sibling\n");
-        uint32_t borrow_idx = left_sibling->header.num_keys - 1;
-        uint32_t borrowed_key = left_sibling->leaf->keys[borrow_idx];
-        uint32_t borrowed_page_id = left_sibling->leaf->page_ids[borrow_idx];
-        uint32_t borrowed_slot_id = left_sibling->leaf->slot_ids[borrow_idx];
-        left_sibling->header.num_keys--;
+    BPTPage *left = &page->bpt;
+    BPTPage *right = &right_page->bpt;
+    right->is_leaf = left->is_leaf;
+    uint16_t split_idx = left->num_keys / 2;
 
-        memmove(&leaf->keys[1], &leaf->keys[0],
-            page->header.num_keys * sizeof(uint32_t));
-        memmove(&leaf->page_ids[1], &leaf->page_ids[0], 
-            page->header.num_keys * sizeof(uint32_t));
-        memmove(&leaf->slot_ids[1], &leaf->slot_ids[0], 
-            page->header.num_keys * sizeof(uint16_t));
-        leaf->keys[0] = borrowed_key;
-        leaf->page_ids[0] = borrowed_page_id;
-        leaf->slot_ids[0] = borrowed_slot_id;
-        page->header.num_keys++;
+    if (left->is_leaf) {
+        // The first key of the right leaf is copied up as the separator
+        uint16_t moved = left->num_keys - split_idx;
+        memcpy(right->leaf.keys, &left->leaf.keys[split_idx], moved * sizeof(uint32_t));
+        memcpy(right->leaf.rids, &left->leaf.rids[split_idx], moved * sizeof(RID));
+        right->num_keys = moved;
+        left->num_keys = split_idx;
 
-        bpt_update_separators(bpt, leaf->keys[0], leaf->keys[1]);
-        return;
-    }
-
-    // Otherwise the right sibling
-    Page *right_sibling = NULL;
-    // Make sure next leaf has the same parent (has to be a sibling i think)
-    if (parent->internal->keys[parent->header.num_keys - 1] != leaf->keys[0]) {
-        right_sibling = buffer_manager_get_page(bpt->bm, leaf->next_page_id);
-        if (right_sibling && right_sibling->header.num_keys > MIN_ENTRIES_LEAF) {
-            // printf("Borrowing from right sibling\n");
-            uint32_t borrow_idx = 0;
-            uint32_t borrowed_key = right_sibling->leaf->keys[borrow_idx];
-            uint32_t borrowed_page_id = right_sibling->leaf->page_ids[borrow_idx];
-            uint32_t borrowed_slot_id = right_sibling->leaf->slot_ids[borrow_idx];
-            memmove(&right_sibling->leaf->keys[0], &right_sibling->leaf->keys[1],
-                (right_sibling->header.num_keys - 1) * sizeof(uint32_t));
-            memmove(&right_sibling->leaf->page_ids[0], &right_sibling->leaf->page_ids[1],
-                (right_sibling->header.num_keys - 1) * sizeof(uint32_t));
-            memmove(&right_sibling->leaf->slot_ids[0], &right_sibling->leaf->slot_ids[1],
-                (right_sibling->header.num_keys - 1) * sizeof(uint16_t));
-            right_sibling->header.num_keys--;
-
-            leaf->keys[page->header.num_keys] = borrowed_key;
-            leaf->page_ids[page->header.num_keys] = borrowed_page_id;
-            leaf->slot_ids[page->header.num_keys] = borrowed_slot_id;
-            page->header.num_keys++;
-
-            bpt_update_separators(bpt, right_sibling->leaf->keys[0], borrowed_key);
-            return;
-        }
-    }
-
-    // If nothing else works, merge with sibling (try left first)
-    if (left_sibling) {
-        // printf("Merging with left sibling\n");
-        uint32_t removed_separator = leaf->keys[0];
-        LeafPage *left_leaf = left_sibling->leaf;
-        memcpy(&left_leaf->keys[left_sibling->header.num_keys],
-            &leaf->keys[0], page->header.num_keys * sizeof(uint32_t));
-        memcpy(&left_leaf->page_ids[left_sibling->header.num_keys],
-            &leaf->page_ids[0], page->header.num_keys * sizeof(uint32_t));
-        memcpy(&left_leaf->slot_ids[left_sibling->header.num_keys],
-            &leaf->slot_ids[0], page->header.num_keys * sizeof(uint16_t));
-        left_sibling->header.num_keys += page->header.num_keys;
-        left_leaf->next_page_id = leaf->next_page_id;
-        buffer_manager_free_page(bpt->bm, page->header.page_id);
-
-        // Remove separator from parent
-        Page *parent = buffer_manager_get_page(bpt->bm, stack_top(bpt->parent_stack));
-        stack_pop(bpt->parent_stack);
-        bpt_remove_internal_separator(bpt, removed_separator, parent);
-        return;
-    }
-    
-    // Else right sibling
-    if (right_sibling) {
-        // printf("Merging with right sibling\n");
-        uint32_t removed_separator = right_sibling->leaf->keys[0];
-        LeafPage *right_leaf = right_sibling->leaf;
-        memcpy(&leaf->keys[page->header.num_keys], &right_leaf->keys[0], 
-            right_sibling->header.num_keys * sizeof(uint32_t));
-        memcpy(&leaf->page_ids[page->header.num_keys], &right_leaf->page_ids[0], 
-            right_sibling->header.num_keys * sizeof(uint32_t));
-        memcpy(&leaf->slot_ids[page->header.num_keys], &right_leaf->slot_ids[0], 
-            right_sibling->header.num_keys * sizeof(uint16_t));
-        page->header.num_keys += right_sibling->header.num_keys;
-        leaf->next_page_id = right_leaf->next_page_id;
-        buffer_manager_free_page(bpt->bm, right_sibling->header.page_id);
-
-        // Remove separator from parent
-        Page *parent = buffer_manager_get_page(bpt->bm, stack_top(bpt->parent_stack));
-        stack_pop(bpt->parent_stack);
-        bpt_remove_internal_separator(bpt, removed_separator, parent);
-        return;
-    }
-    
-    // Unreachable as the leaf has to have atleast one sibling 
-    // if the tree is valid (Follows as every internal node apart
-    // from the root has to have atleast MIN_CHILDREN children and
-    // if the root ever has only one child, that child becomes the new root)
-    printf("DEBUG: Should never reach");
-    return;
-}
-
-int bpt_empty(BPTree *bpt) {
-    return !bpt->root || bpt->root->header.num_keys == 0;
-}
-
-// WARNING, DO NOT USE unless familiar with tree
-// Reads the entirety of the data linked to the root
-int bpt_verify_recursively(BPTree *bpt, Page *node, int lower, int upper) {
-    int root = lower == 0 && upper == INT32_MAX;
-
-    if (node->header.is_leaf) {
-        // First of all assert that the seperator is correct
-        if (lower != 0) assert(node->leaf->keys[0] == lower);
-        for (int i = 1; i < node->header.num_keys; i++) {
-            assert(node->leaf->keys[i] > node->leaf->keys[i - 1]);
-            assert(node->leaf->keys[i] >= lower && node->leaf->keys[i] < upper);
-        }
-
-        if (!root) {
-            assert(node->header.num_keys >= MIN_ENTRIES_LEAF);
-            assert(node->header.num_keys <= MAX_ENTRIES_LEAF);
-        }
-
-        // Return height of subtree
-        return 1;
+        right->leaf.next_page_id = left->leaf.next_page_id;
+        left->leaf.next_page_id = right_page->page_id;
+        *separator = right->leaf.keys[0];
     }
     else {
-        // First of all assert seperator is correct
-        if (lower != 0) assert(node->internal->keys[0] == lower);
-        Page *left_child = buffer_manager_get_page(bpt->bm, node->internal->children[0]);
+        // The middle key is moved up as the separator, it is kept in
+        // neither of the two nodes
+        uint16_t moved = left->num_keys - split_idx - 1;
+        *separator = left->internal.keys[split_idx];
+        memcpy(right->internal.keys, &left->internal.keys[split_idx + 1],
+            moved * sizeof(uint32_t));
+        memcpy(right->internal.children, &left->internal.children[split_idx + 1],
+            (moved + 1) * sizeof(uint32_t));
+        right->num_keys = moved;
+        left->num_keys = split_idx;
+    }
 
-        // Assert order
-        assert(node->internal->keys[0] >= lower);
+    *right_page_id = right_page->page_id;
+    mark_dirty(bpt, page);
+    // New pages are already dirty
+    unpin(bpt, right_page);
+    return DB_OK;
+}
 
-        // Assert leftmost child
-        int sub_tree_height = bpt_verify_recursively(bpt, left_child, lower, 
-            node->internal->keys[0]);
-        
-        // For checking next_page_id
-        Page *prev_child = left_child;
+// Moves the content of the root into a new page, the root becomes an
+// internal node without keys that has the new page as its only child.
+// This way the root page id never changes when the tree grows.
+static DBStatus grow_root(BPTree *bpt, Page *root, Page **child) {
+    DBStatus rc = buffer_manager_new_page(bpt->bm, PAGE_TYPE_BPT, child);
+    if (rc != DB_OK) return rc;
 
-        for (int i = 0; i < node->header.num_keys; i++) {
+    (*child)->bpt = root->bpt;
+    root->bpt.is_leaf = BPT_INTERNAL;
+    root->bpt.num_keys = 0;
+    root->bpt.internal.children[0] = (*child)->page_id;
+    mark_dirty(bpt, root);
+    return DB_OK;
+}
 
-            // Assert order
-            if (i != 0) assert(node->internal->keys[i] > node->internal->keys[i - 1]);
+// page is pinned and has one key too many. Splits it and inserts the
+// separator into the parent, and continues upwards as long as the parent
+// overflows. Consumes the pin of page.
+static DBStatus split_upwards(BPTree *bpt, Path *path, Page *page) {
+    for (;;) {
+        if (path->depth == 0) {
+            // page is the root
+            Page *child;
+            DBStatus rc = grow_root(bpt, page, &child);
+            unpin(bpt, page);
+            if (rc != DB_OK) return rc;
 
-            int child_lower = node->internal->keys[i];
-            int child_upper = i == node->header.num_keys - 1 ? 
-                upper : node->internal->keys[i + 1];
-            Page *child = buffer_manager_get_page(bpt->bm, node->internal->children[i + 1]);
-
-            // Assert child
-            int child_tree_height = bpt_verify_recursively(bpt, 
-                child, child_lower, child_upper);
-            
-            // Assert sub_tree_heights
-            assert(child_tree_height == sub_tree_height);
-
-            // Assert linked list
-            if (child->header.is_leaf) {
-                assert(prev_child->leaf->next_page_id == child->header.page_id);
-                prev_child = child;
-            }
+            path->entries[0].page_id = bpt->root_page_id;
+            path->entries[0].child_idx = 0;
+            path->depth = 1;
+            page = child;
         }
 
-        if (!root) {
-            assert(node->header.num_keys + 1 >= MIN_CHILDREN);
-            assert(node->header.num_keys + 1 <= MAX_CHILDREN);
+        uint32_t separator, right_page_id;
+        DBStatus rc = split_node(bpt, page, &separator, &right_page_id);
+        unpin(bpt, page);
+        if (rc != DB_OK) return rc;
+
+        path->depth--;
+        PathEntry parent_entry = path->entries[path->depth];
+        Page *parent;
+        rc = pin_node(bpt, parent_entry.page_id, &parent);
+        if (rc != DB_OK) return rc;
+
+        internal_insert_at(&parent->bpt, parent_entry.child_idx, separator, right_page_id);
+        mark_dirty(bpt, parent);
+        if (parent->bpt.num_keys <= MAX_KEYS) {
+            unpin(bpt, parent);
+            return DB_OK;
         }
+        page = parent;
     }
 }
 
-void bpt_verify_tree(BPTree *bpt) {
-    bpt_verify_recursively(bpt, bpt->root, 0, INT32_MAX);
+DBStatus bpt_insert(BPTree *bpt, uint32_t key, const void *data, uint32_t size) {
+    Path path;
+    Page *leaf;
+    DBStatus rc = find_leaf(bpt, key, &path, &leaf);
+    if (rc != DB_OK) return rc;
+
+    BPTPage *node = &leaf->bpt;
+    uint32_t idx = lower_bound(node->leaf.keys, node->num_keys, key);
+    if (idx < node->num_keys && node->leaf.keys[idx] == key) {
+        // Overwrite the old record
+        RID rid = node->leaf.rids[idx];
+        RID new_rid;
+        rc = record_update(bpt->bm, rid, data, size, &new_rid);
+        if (rc == DB_NOT_FOUND) rc = DB_ERR_CORRUPT;
+        if (rc == DB_OK && !rid_equal(rid, new_rid)) {
+            node->leaf.rids[idx] = new_rid;
+            mark_dirty(bpt, leaf);
+        }
+        unpin(bpt, leaf);
+        return rc;
+    }
+
+    RID rid;
+    rc = record_insert(bpt->bm, data, size, &rid);
+    if (rc != DB_OK) {
+        unpin(bpt, leaf);
+        return rc;
+    }
+
+    leaf_insert_at(node, idx, key, rid);
+    mark_dirty(bpt, leaf);
+    if (node->num_keys <= MAX_ENTRIES_LEAF) {
+        unpin(bpt, leaf);
+        return DB_OK;
+    }
+
+    return split_upwards(bpt, &path, leaf);
 }
 
-/*
-// Warning, reads entire tree
-void bpt_print(BPTree *bpt) {
-    if (!bpt->root) return;
 
-    Page *queue[1024];
-    uint32_t front = 0, back = 0;
+// ---- Deletion ----
 
-    uint32_t nodes_in_level = 1;
-    uint32_t nodes_next_level = 0;
+// node is child idx of parent and left is child idx - 1. Moves the last
+// entry of left into node.
+static void borrow_from_left(BPTPage *node, BPTPage *left, BPTPage *parent,
+        uint32_t idx) {
+    if (node->is_leaf) {
+        uint32_t last = left->num_keys - 1;
+        leaf_insert_at(node, 0, left->leaf.keys[last], left->leaf.rids[last]);
+        left->num_keys--;
+        parent->internal.keys[idx - 1] = node->leaf.keys[0];
+        return;
+    }
 
-    queue[back++] = bpt->root;
+    // Rotate through the parent: the separator moves down into node and
+    // the last key of left moves up to become the new separator
+    InternalPage *internal = &node->internal;
+    memmove(&internal->keys[1], &internal->keys[0], node->num_keys * sizeof(uint32_t));
+    memmove(&internal->children[1], &internal->children[0],
+        (node->num_keys + 1) * sizeof(uint32_t));
+    internal->keys[0] = parent->internal.keys[idx - 1];
+    internal->children[0] = left->internal.children[left->num_keys];
+    parent->internal.keys[idx - 1] = left->internal.keys[left->num_keys - 1];
+    left->num_keys--;
+    node->num_keys++;
+}
 
-    uint32_t level = 0;
-    printf("L0 ");
-    while (front < back) {
-        Page *node = queue[front++];
-        nodes_in_level--;
+// node is child idx of parent and right is child idx + 1. Moves the first
+// entry of right into node.
+static void borrow_from_right(BPTPage *node, BPTPage *right, BPTPage *parent,
+        uint32_t idx) {
+    if (node->is_leaf) {
+        leaf_insert_at(node, node->num_keys, right->leaf.keys[0], right->leaf.rids[0]);
+        leaf_remove_at(right, 0);
+        parent->internal.keys[idx] = right->leaf.keys[0];
+        return;
+    }
 
-        // Print node keys
-        printf("[");
-#ifdef FULL_DEBUG
-        printf("%p | ", node->pointers[0]);
-#endif
-        for (uint32_t i = 0; i < node->header.num_keys; i++) {
-#ifdef FULL_DEBUG
-            printf("%u-%u-%u-", node->keys[i], node->is_leaf, node->num_keys);
-            // printf("%p", node->pointers[i + 1]);
-            printf("%p", node->parent);
-#else
-            printf("%u", node->keys[i]);
-#endif
-            if (i < node->num_keys - 1) printf(" | ");
+    InternalPage *internal = &node->internal;
+    InternalPage *right_internal = &right->internal;
+    internal->keys[node->num_keys] = parent->internal.keys[idx];
+    internal->children[node->num_keys + 1] = right_internal->children[0];
+    parent->internal.keys[idx] = right_internal->keys[0];
+    memmove(&right_internal->keys[0], &right_internal->keys[1],
+        (right->num_keys - 1) * sizeof(uint32_t));
+    memmove(&right_internal->children[0], &right_internal->children[1],
+        right->num_keys * sizeof(uint32_t));
+    right->num_keys--;
+    node->num_keys++;
+}
+
+// Appends right to left. parent->keys[separator_idx] separates the two nodes,
+// it is removed from the parent together with the pointer to right.
+static void merge_nodes(BPTPage *left, BPTPage *right, BPTPage *parent,
+        uint32_t separator_idx) {
+    if (left->is_leaf) {
+        memcpy(&left->leaf.keys[left->num_keys], right->leaf.keys,
+            right->num_keys * sizeof(uint32_t));
+        memcpy(&left->leaf.rids[left->num_keys], right->leaf.rids,
+            right->num_keys * sizeof(RID));
+        left->num_keys += right->num_keys;
+        left->leaf.next_page_id = right->leaf.next_page_id;
+    }
+    else {
+        // The separator moves down between the keys of the two nodes
+        InternalPage *internal = &left->internal;
+        internal->keys[left->num_keys] = parent->internal.keys[separator_idx];
+        memcpy(&internal->keys[left->num_keys + 1], right->internal.keys,
+            right->num_keys * sizeof(uint32_t));
+        memcpy(&internal->children[left->num_keys + 1], right->internal.children,
+            (right->num_keys + 1) * sizeof(uint32_t));
+        left->num_keys += 1 + right->num_keys;
+    }
+
+    internal_remove_at(parent, separator_idx);
+}
+
+// The root has no keys left and a single child. The child is copied into
+// the root (so that the root page id stays the same) and freed.
+static DBStatus collapse_root(BPTree *bpt, Page *root) {
+    Page *child;
+    DBStatus rc = pin_node(bpt, root->bpt.internal.children[0], &child);
+    if (rc != DB_OK) return rc;
+
+    root->bpt = child->bpt;
+    mark_dirty(bpt, root);
+    rc = buffer_manager_free_page(bpt->bm, child);
+    if (rc != DB_OK) unpin(bpt, child);
+    return rc;
+}
+
+// page is pinned, it is not the root and has one key too few. Fixes it by
+// borrowing from or merging with a sibling. If a merge leaves the parent
+// with too few keys, the parent is returned pinned in underfull_parent so
+// that it can be fixed next. Consumes the pin of page.
+static DBStatus rebalance_step(BPTree *bpt, Path *path, Page *page,
+        Page **underfull_parent) {
+    *underfull_parent = NULL;
+    path->depth--;
+    PathEntry parent_entry = path->entries[path->depth];
+    uint32_t idx = parent_entry.child_idx;
+    Page *parent = NULL, *left = NULL, *right = NULL;
+
+    DBStatus rc = pin_node(bpt, parent_entry.page_id, &parent);
+    if (rc != DB_OK) goto out;
+
+    BPTPage *p = &parent->bpt;
+    if (p->is_leaf || idx > p->num_keys ||
+            p->internal.children[idx] != page->page_id) {
+        fprintf(stderr, "bptree: page %u is not the parent of page %u\n",
+            parent->page_id, page->page_id);
+        rc = DB_ERR_CORRUPT;
+        goto out;
+    }
+
+    if (idx > 0) {
+        rc = pin_node(bpt, p->internal.children[idx - 1], &left);
+        if (rc != DB_OK) goto out;
+        if (can_lend(&left->bpt)) {
+            borrow_from_left(&page->bpt, &left->bpt, p, idx);
+            mark_dirty(bpt, page);
+            mark_dirty(bpt, left);
+            mark_dirty(bpt, parent);
+            goto out;
         }
-        printf("] ");
+    }
 
-        // Enqueue children if internal
-        if (!node->is_leaf) {
-            for (uint32_t i = 0; i <= node->num_keys; i++) {
-                queue[back++] = buffer_manager_get_page(bpt->bm, node->pointers[i]);
-                nodes_next_level++;
-            }
+    if (idx < p->num_keys) {
+        rc = pin_node(bpt, p->internal.children[idx + 1], &right);
+        if (rc != DB_OK) goto out;
+        if (can_lend(&right->bpt)) {
+            borrow_from_right(&page->bpt, &right->bpt, p, idx);
+            mark_dirty(bpt, page);
+            mark_dirty(bpt, right);
+            mark_dirty(bpt, parent);
+            goto out;
         }
+    }
 
-        // End of a level
-        if (nodes_in_level == 0) {
-            printf("\n");
-            nodes_in_level = nodes_next_level;
-            nodes_next_level = 0;
-            level++;
-            if (nodes_in_level != 0) {
-                printf("L%d ", level);
+    // No sibling can lend an entry, so merge with one of them. The merged
+    // node fits as one of them has MIN entries and the other MIN - 1.
+    if (left) {
+        merge_nodes(&left->bpt, &page->bpt, p, idx - 1);
+        mark_dirty(bpt, left);
+        rc = buffer_manager_free_page(bpt->bm, page);
+        if (rc != DB_OK) goto out;
+        page = NULL;
+    }
+    else if (right) {
+        merge_nodes(&page->bpt, &right->bpt, p, idx);
+        mark_dirty(bpt, page);
+        rc = buffer_manager_free_page(bpt->bm, right);
+        if (rc != DB_OK) goto out;
+        right = NULL;
+    }
+    else {
+        fprintf(stderr, "bptree: page %u has no siblings\n", page->page_id);
+        rc = DB_ERR_CORRUPT;
+        goto out;
+    }
+    mark_dirty(bpt, parent);
+
+    // The merged node may be the child that collapse_root frees, so it
+    // must not be pinned anymore
+    unpin(bpt, page);
+    unpin(bpt, left);
+    unpin(bpt, right);
+    page = left = right = NULL;
+
+    if (path->depth == 0) {
+        // The parent is the root, it may have few keys but not zero
+        if (p->num_keys == 0) rc = collapse_root(bpt, parent);
+    }
+    else if (is_underfull(p)) {
+        *underfull_parent = parent;
+        parent = NULL;
+    }
+
+out:
+    unpin(bpt, page);
+    unpin(bpt, left);
+    unpin(bpt, right);
+    unpin(bpt, parent);
+    return rc;
+}
+
+DBStatus bpt_delete(BPTree *bpt, uint32_t key) {
+    Path path;
+    Page *leaf;
+    DBStatus rc = find_leaf(bpt, key, &path, &leaf);
+    if (rc != DB_OK) return rc;
+
+    BPTPage *node = &leaf->bpt;
+    uint32_t idx = lower_bound(node->leaf.keys, node->num_keys, key);
+    if (idx == node->num_keys || node->leaf.keys[idx] != key) {
+        unpin(bpt, leaf);
+        return DB_NOT_FOUND;
+    }
+
+    rc = record_delete(bpt->bm, node->leaf.rids[idx]);
+    if (rc != DB_OK) {
+        unpin(bpt, leaf);
+        return rc == DB_NOT_FOUND ? DB_ERR_CORRUPT : rc;
+    }
+
+    leaf_remove_at(node, idx);
+    mark_dirty(bpt, leaf);
+
+    // The separators in the parents do not have to be updated even if the
+    // smallest key of the leaf was removed. They only have to be bounds:
+    // every key in children[i] < keys[i] <= every key in children[i + 1]
+    Page *page = leaf;
+    if (path.depth == 0 || !is_underfull(node)) {
+        unpin(bpt, page);
+        return DB_OK;
+    }
+
+    while (page) {
+        Page *underfull_parent;
+        rc = rebalance_step(bpt, &path, page, &underfull_parent);
+        if (rc != DB_OK) return rc;
+        page = underfull_parent;
+    }
+    return DB_OK;
+}
+
+
+// ---- Destroy ----
+
+static DBStatus destroy_node(BPTree *bpt, uint32_t page_id, uint32_t depth) {
+    if (depth >= BPT_MAX_HEIGHT) return DB_ERR_CORRUPT;
+
+    Page *page;
+    DBStatus rc = pin_node(bpt, page_id, &page);
+    if (rc != DB_OK) return rc;
+
+    if (page->bpt.is_leaf) {
+        for (uint32_t i = 0; i < page->bpt.num_keys; i++) {
+            rc = record_delete(bpt->bm, page->bpt.leaf.rids[i]);
+            if (rc != DB_OK) {
+                unpin(bpt, page);
+                return rc;
             }
         }
     }
+    else {
+        // Copy the children so that the page does not have to stay pinned
+        // during the recursion
+        uint32_t children[MAX_CHILDREN + 1];
+        uint32_t child_count = page->bpt.num_keys + 1u;
+        memcpy(children, page->bpt.internal.children, child_count * sizeof(uint32_t));
+        unpin(bpt, page);
+
+        for (uint32_t i = 0; i < child_count; i++) {
+            rc = destroy_node(bpt, children[i], depth + 1);
+            if (rc != DB_OK) return rc;
+        }
+
+        rc = pin_node(bpt, page_id, &page);
+        if (rc != DB_OK) return rc;
+    }
+
+    rc = buffer_manager_free_page(bpt->bm, page);
+    if (rc != DB_OK) unpin(bpt, page);
+    return rc;
 }
-*/
+
+DBStatus bpt_destroy(BPTree *bpt) {
+    DBStatus rc = destroy_node(bpt, bpt->root_page_id, 0);
+    free(bpt);
+    return rc;
+}
+
+
+// ---- Debugging ----
+
+typedef struct VerifyState {
+    uint8_t seen_leaf;
+    uint32_t leaf_depth;     // All leaves have to be at the same depth
+    uint32_t expected_leaf;  // next_page_id of the previous leaf
+    BPTStats stats;
+} VerifyState;
+
+#define VERIFY_FAIL(...) do { \
+        fprintf(stderr, "bpt_verify: page %u: ", page_id); \
+        fprintf(stderr, __VA_ARGS__); \
+        fprintf(stderr, "\n"); \
+        return DB_ERR_CORRUPT; \
+    } while (0)
+
+// Checks a single node: key order, separator bounds [lower, upper) and fill
+static DBStatus verify_node_content(uint32_t page_id, const BPTPage *node,
+        uint8_t is_root, uint64_t lower, uint64_t upper) {
+    if (node->num_keys > (node->is_leaf ? MAX_ENTRIES_LEAF : MAX_KEYS)) {
+        VERIFY_FAIL("node has %u keys, max is %u", node->num_keys,
+            node->is_leaf ? MAX_ENTRIES_LEAF : MAX_KEYS);
+    }
+
+    const uint32_t *keys = node->is_leaf ? node->leaf.keys : node->internal.keys;
+    for (uint32_t i = 0; i < node->num_keys; i++) {
+        if (keys[i] < lower || keys[i] >= upper) {
+            VERIFY_FAIL("key %u is outside of [%llu, %llu)", keys[i],
+                (unsigned long long)lower, (unsigned long long)upper);
+        }
+        if (i > 0 && keys[i] <= keys[i - 1]) {
+            VERIFY_FAIL("keys are not sorted at index %u", i);
+        }
+    }
+
+    if (node->is_leaf) {
+        if (!is_root && node->num_keys < MIN_ENTRIES_LEAF) {
+            VERIFY_FAIL("leaf has %u entries, min is %u",
+                node->num_keys, MIN_ENTRIES_LEAF);
+        }
+        return DB_OK;
+    }
+
+    if (node->num_keys == 0) VERIFY_FAIL("internal node without keys");
+    if (!is_root && node->num_keys + 1 < MIN_CHILDREN) {
+        VERIFY_FAIL("internal node has %u children, min is %u",
+            node->num_keys + 1, MIN_CHILDREN);
+    }
+    return DB_OK;
+}
+
+// Checks the subtree rooted at page_id, every key in it has to be in
+// [lower, upper)
+static DBStatus verify_node(BPTree *bpt, uint32_t page_id, uint32_t depth,
+        uint64_t lower, uint64_t upper, VerifyState *state) {
+    if (depth >= BPT_MAX_HEIGHT) VERIFY_FAIL("tree is too deep");
+
+    Page *page;
+    DBStatus rc = pin_node(bpt, page_id, &page);
+    if (rc != DB_OK) return rc;
+
+    // Copy what is needed so that the page does not have to stay pinned
+    // while the children and records are read
+    BPTPage *node = &page->bpt;
+    uint8_t is_leaf = node->is_leaf;
+    uint32_t count = node->num_keys;
+    uint32_t next_page_id = NULL_PAGE_ID;
+    RID rids[MAX_ENTRIES_LEAF];
+    uint32_t keys[MAX_KEYS];
+    uint32_t children[MAX_CHILDREN];
+
+    rc = verify_node_content(page_id, node, depth == 0, lower, upper);
+    if (rc == DB_OK && is_leaf) {
+        next_page_id = node->leaf.next_page_id;
+        memcpy(rids, node->leaf.rids, count * sizeof(RID));
+    }
+    else if (rc == DB_OK) {
+        memcpy(keys, node->internal.keys, count * sizeof(uint32_t));
+        memcpy(children, node->internal.children, (count + 1) * sizeof(uint32_t));
+    }
+    unpin(bpt, page);
+    if (rc != DB_OK) return rc;
+
+    if (is_leaf) {
+        if (state->seen_leaf) {
+            if (depth != state->leaf_depth) {
+                VERIFY_FAIL("leaf at depth %u, expected %u", depth, state->leaf_depth);
+            }
+            if (page_id != state->expected_leaf) {
+                VERIFY_FAIL("previous leaf points to %u", state->expected_leaf);
+            }
+        }
+        state->seen_leaf = 1;
+        state->leaf_depth = depth;
+        state->expected_leaf = next_page_id;
+        state->stats.leaf_count++;
+        state->stats.key_count += count;
+
+        for (uint32_t i = 0; i < count; i++) {
+            void *data;
+            uint32_t size;
+            rc = record_read(bpt->bm, rids[i], &data, &size);
+            if (rc != DB_OK) {
+                VERIFY_FAIL("record (%u, %u) of entry %u cannot be read: %s",
+                    rids[i].page_id, rids[i].slot_id, i, db_status_str(rc));
+            }
+            free(data);
+        }
+        return DB_OK;
+    }
+
+    state->stats.internal_count++;
+    for (uint32_t i = 0; i <= count; i++) {
+        uint64_t child_lower = i == 0 ? lower : keys[i - 1];
+        uint64_t child_upper = i == count ? upper : keys[i];
+        rc = verify_node(bpt, children[i], depth + 1, child_lower, child_upper, state);
+        if (rc != DB_OK) return rc;
+    }
+    return DB_OK;
+}
+
+DBStatus bpt_verify(BPTree *bpt, BPTStats *stats) {
+    VerifyState state;
+    memset(&state, 0, sizeof(state));
+
+    uint32_t page_id = bpt->root_page_id;
+    DBStatus rc = verify_node(bpt, page_id, 0, 0, (uint64_t)UINT32_MAX + 1, &state);
+    if (rc != DB_OK) return rc;
+
+    if (state.expected_leaf != NULL_PAGE_ID) {
+        VERIFY_FAIL("last leaf points to page %u", state.expected_leaf);
+    }
+
+    state.stats.height = state.leaf_depth + 1;
+    if (stats) *stats = state.stats;
+    return DB_OK;
+}
+
+static DBStatus print_node(BPTree *bpt, uint32_t page_id, uint32_t depth, FILE *out) {
+    if (depth >= BPT_MAX_HEIGHT) return DB_ERR_CORRUPT;
+
+    Page *page;
+    DBStatus rc = pin_node(bpt, page_id, &page);
+    if (rc != DB_OK) return rc;
+
+    BPTPage *node = &page->bpt;
+    fprintf(out, "%*s%s %u:", (int)(2 * depth), "",
+        node->is_leaf ? "leaf" : "internal", page_id);
+    const uint32_t *keys = node->is_leaf ? node->leaf.keys : node->internal.keys;
+    for (uint32_t i = 0; i < node->num_keys; i++) fprintf(out, " %u", keys[i]);
+    if (node->is_leaf) fprintf(out, " -> %u", node->leaf.next_page_id);
+    fprintf(out, "\n");
+
+    uint32_t child_count = node->is_leaf ? 0 : node->num_keys + 1u;
+    uint32_t children[MAX_CHILDREN + 1];
+    memcpy(children, node->internal.children, child_count * sizeof(uint32_t));
+    unpin(bpt, page);
+
+    for (uint32_t i = 0; i < child_count; i++) {
+        rc = print_node(bpt, children[i], depth + 1, out);
+        if (rc != DB_OK) return rc;
+    }
+    return DB_OK;
+}
+
+DBStatus bpt_print(BPTree *bpt, FILE *out) {
+    return print_node(bpt, bpt->root_page_id, 0, out);
+}
