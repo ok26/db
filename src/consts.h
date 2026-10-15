@@ -1,9 +1,0 @@
-#define MAX_CHILDREN 512
-#define MIN_CHILDREN (MAX_CHILDREN + 1) / 2
-#define MAX_KEYS MAX_CHILDREN - 1
-
-#define MAX_ENTRIES_LEAF 408
-#define MIN_ENTRIES_LEAF (MAX_ENTRIES_LEAF + 1) / 2
-
-#define INTERNAL 0
-#define LEAF 1

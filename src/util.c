@@ -6,7 +6,7 @@
 #define STACK_DEFAULT_SIZE 8
 
 // Returns index of first element strictly greater than v
-uint32_t upper_bound(uint32_t *arr, uint32_t len, uint32_t v) {
+uint32_t upper_bound(const uint32_t *arr, uint32_t len, uint32_t v) {
     uint32_t l = 0, r = len;
     while (l < r) {
         uint32_t mid = l + (r - l) / 2;
@@ -22,7 +22,7 @@ uint32_t upper_bound(uint32_t *arr, uint32_t len, uint32_t v) {
 }
 
 // Returns index of first element greater than or equal to v
-uint32_t lower_bound(uint32_t *arr, uint32_t len, uint32_t v) {
+uint32_t lower_bound(const uint32_t *arr, uint32_t len, uint32_t v) {
     uint32_t l = 0, r = len;
     while (l < r) {
         uint32_t mid = l + (r - l) / 2;
@@ -37,12 +37,6 @@ uint32_t lower_bound(uint32_t *arr, uint32_t len, uint32_t v) {
     return l;
 }
 
-uint32_t *clone_u32(uint32_t *src) {
-    uint32_t *dst = malloc(sizeof(uint32_t));
-    *dst = *src;
-    return dst;
-}
-
 
 struct Stack {
     uint32_t *stack;
@@ -50,15 +44,21 @@ struct Stack {
     uint32_t resvsize;
 };
 
-Stack *stack_init() {
+Stack *stack_init(void) {
     Stack *stack = malloc(sizeof(Stack));
+    if (!stack) return NULL;
     stack->resvsize = STACK_DEFAULT_SIZE;
     stack->stack = malloc(sizeof(uint32_t) * stack->resvsize);
+    if (!stack->stack) {
+        free(stack);
+        return NULL;
+    }
     stack->size = 0;
     return stack;
 }
 
 void stack_free(Stack *stack) {
+    if (!stack) return;
     free(stack->stack);
     free(stack);
 }
@@ -76,13 +76,17 @@ void stack_pop(Stack *stack) {
     }
 }
 
-void stack_push(Stack *stack, uint32_t value) {
+uint8_t stack_push(Stack *stack, uint32_t value) {
     if (stack->size == stack->resvsize) {
+        uint32_t *grown = realloc(stack->stack,
+            sizeof(uint32_t) * stack->resvsize * 2);
+        if (!grown) return 0;
+        stack->stack = grown;
         stack->resvsize *= 2;
-        stack->stack = realloc(stack->stack, sizeof(uint32_t) * stack->resvsize);
     }
     stack->stack[stack->size] = value;
     stack->size++;
+    return 1;
 }
 
 void stack_clear(Stack *stack) {
@@ -93,15 +97,21 @@ uint8_t stack_is_empty(Stack *stack) {
     return stack->size == 0;
 }
 
+uint32_t stack_size(Stack *stack) {
+    return stack->size;
+}
+
 Stack *stack_clone(Stack *stack) {
     Stack *new_stack = malloc(sizeof(Stack));
+    if (!new_stack) return NULL;
     new_stack->size = stack->size;
     new_stack->resvsize = stack->resvsize;
     new_stack->stack = malloc(sizeof(uint32_t) * stack->resvsize);
-    // Copy existing stack entries so the clone is a true copy
-    if (stack->size > 0) {
-        memcpy(new_stack->stack, stack->stack, sizeof(uint32_t) * stack->size);
+    if (!new_stack->stack) {
+        free(new_stack);
+        return NULL;
     }
+    memcpy(new_stack->stack, stack->stack, sizeof(uint32_t) * stack->size);
     return new_stack;
 }
 
@@ -116,45 +126,45 @@ struct RBTreeNode {
     uint32_t key;
     void *value;
     uint8_t color;
-    struct RBTreeNode *left;
+    RBTreeNode *left;
     RBTreeNode *right;
     RBTreeNode *parent;
 };
 
-RBTreeNode *rbtn_new_root(uint32_t key, void *value, size_t size) {
-    RBTreeNode *root = malloc(sizeof(RBTreeNode));
-    root->color = RBTN_RED;
-    root->key = key;
-    root->value = malloc(size);
-    memcpy(root->value, value, size);
-    root->parent = NULL;
-    root->left = NULL;
-    root->right = NULL;
-    return root;
-}
-
-RBTreeNode *rbtn_new(uint32_t key, void *value, size_t size, RBTreeNode *parent) {
+static RBTreeNode *rbtn_new(uint32_t key, const void *value, size_t size,
+        RBTreeNode *parent) {
     RBTreeNode *node = malloc(sizeof(RBTreeNode));
+    if (!node) return NULL;
+    // malloc(0) may return NULL, always allocate at least one byte
+    node->value = malloc(size ? size : 1);
+    if (!node->value) {
+        free(node);
+        return NULL;
+    }
+    memcpy(node->value, value, size);
     node->color = RBTN_RED;
     node->key = key;
-    node->value = malloc(size);
-    memcpy(node->value, value, size);
     node->parent = parent;
     node->left = NULL;
     node->right = NULL;
     return node;
 }
 
-void rbtn_free(RBTreeNode *node) {
-    if (node->left) rbtn_free(node->left);
-    if (node->right) rbtn_free(node->right);
+static void rbtn_free(RBTreeNode *node) {
+    if (!node) return;
+    rbtn_free(node->left);
+    rbtn_free(node->right);
     free(node->value);
     free(node);
 }
 
-void rbtn_free_single(RBTreeNode *node) {
+static void rbtn_free_single(RBTreeNode *node) {
     free(node->value);
     free(node);
+}
+
+static uint8_t rbtn_is_red(RBTreeNode *node) {
+    return node && node->color == RBTN_RED;
 }
 
 struct RBTree {
@@ -162,35 +172,41 @@ struct RBTree {
     uint32_t size;
 };
 
-RBTree *rbt_init() {
+RBTree *rbt_init(void) {
     RBTree *rbt = malloc(sizeof(RBTree));
+    if (!rbt) return NULL;
     rbt->root = NULL;
     rbt->size = 0;
     return rbt;
 }
 
-RBTreeNode *rbt_search(RBTree *rbt, uint32_t key) {
-    if (!rbt->root) return NULL;
-
+// Returns the node with the given key, or the node that would become its
+// parent if the key does not exist. Returns NULL for an empty tree.
+static RBTreeNode *rbt_search(RBTree *rbt, uint32_t key) {
     RBTreeNode *node = rbt->root;
-    while (1) {
+    while (node) {
         if (key == node->key) {
             return node;
         }
 
-        if (key >= node->key) {
-            if (!node->right) return node;
-            else node = node->right;
-        }
-        else {
-            if (!node->left) return node;
-            else node = node->left;
-        }
+        RBTreeNode *next = key > node->key ? node->right : node->left;
+        if (!next) return node;
+        node = next;
     }
+    return NULL;
+}
+
+// Replaces the child `old_child` of `parent` with `new_child`
+static void rbt_replace_child(RBTree *rbt, RBTreeNode *parent,
+        RBTreeNode *old_child, RBTreeNode *new_child) {
+    if (!parent) rbt->root = new_child;
+    else if (parent->left == old_child) parent->left = new_child;
+    else parent->right = new_child;
 }
 
 // From: https://en.wikipedia.org/wiki/Red%E2%80%93black_tree
-void rbt_rotate(RBTree *rbt, RBTreeNode *node, uint8_t left_rotation) {
+// A left rotation moves node->right up into the place of node
+static void rbt_rotate(RBTree *rbt, RBTreeNode *node, uint8_t left_rotation) {
     RBTreeNode *parent = node->parent;
     RBTreeNode *new_root = left_rotation ? node->right : node->left;
     RBTreeNode *new_child = left_rotation ? new_root->left : new_root->right;
@@ -207,64 +223,59 @@ void rbt_rotate(RBTree *rbt, RBTreeNode *node, uint8_t left_rotation) {
 
     new_root->parent = parent;
     node->parent = new_root;
-    if (parent) {
-        if (node == parent->right) parent->right = new_root;
-        else parent->left = new_root;
-    }
-    else {
-        rbt->root = new_root;
-    }
+    rbt_replace_child(rbt, parent, node, new_root);
 }
 
-void rbt_insert(RBTree *rbt, uint32_t key, void *value, size_t size) {
-    if (!rbt->root) {
-        rbt->root = rbtn_new_root(key, value, size);
-        rbt->size = 1;
-        return;
-    }
-
-    RBTreeNode *parent = rbt_search(rbt, key); // Cannot be null as root exists
-    if (parent->key == key) {
+uint8_t rbt_insert(RBTree *rbt, uint32_t key, const void *value, size_t size) {
+    RBTreeNode *parent = rbt_search(rbt, key);
+    if (parent && parent->key == key) {
         // If key already exists, update value
-        parent->value = realloc(parent->value, size);
-        memcpy(parent->value, value, size);
-        return;
+        void *new_value = malloc(size ? size : 1);
+        if (!new_value) return 0;
+        memcpy(new_value, value, size);
+        free(parent->value);
+        parent->value = new_value;
+        return 1;
     }
-
-    rbt->size++;
 
     RBTreeNode *node = rbtn_new(key, value, size, parent);
+    if (!node) return 0;
+    rbt->size++;
 
-    uint8_t left_child = key < parent->key;
-    if (left_child) parent->left = node;
+    if (!parent) {
+        node->color = RBTN_BLACK;
+        rbt->root = node;
+        return 1;
+    }
+
+    if (key < parent->key) parent->left = node;
     else parent->right = node;
 
-    while (parent) {
-        if (node->parent->color == RBTN_BLACK) {
-            return;
-        }
-
+    // Rebalance, node is red and might have a red parent
+    while (parent && parent->color == RBTN_RED) {
         RBTreeNode *grandparent = parent->parent;
         if (!grandparent) {
+            // Parent is the root, simply recolor it
             parent->color = RBTN_BLACK;
-            return;
+            break;
         }
 
         uint8_t parent_left_child = grandparent->left == parent;
         RBTreeNode *uncle = parent_left_child ?
             grandparent->right : grandparent->left;
-        if (!uncle || uncle->color == RBTN_BLACK) {
+        if (!rbtn_is_red(uncle)) {
             uint8_t node_left_child = parent->left == node;
             if (node_left_child != parent_left_child) {
+                // Inner grandchild, rotate it to the outside first
                 rbt_rotate(rbt, parent, parent_left_child);
                 node = parent;
                 parent = parent_left_child ? grandparent->left : grandparent->right;
             }
 
             rbt_rotate(rbt, grandparent, !parent_left_child);
-			parent->color = RBTN_BLACK;
-			grandparent->color = RBTN_RED;
-			return;
+            parent->color = RBTN_BLACK;
+            grandparent->color = RBTN_RED;
+            break;
         }
 
         parent->color = RBTN_BLACK;
@@ -273,152 +284,110 @@ void rbt_insert(RBTree *rbt, uint32_t key, void *value, size_t size) {
         node = grandparent;
         parent = node->parent;
     }
+
+    rbt->root->color = RBTN_BLACK;
+    return 1;
 }
 
-// Helper
-void rbt_delete_node(RBTree *rbt, RBTreeNode *node, size_t data_size) {
-    uint8_t child_cnt = (node->left != NULL) + (node->right != NULL);
-    uint8_t node_is_root = !node->parent;
+// Restores the black height after a black leaf was removed from the
+// side `left` of `parent`. Cases are named as in the wikipedia article.
+static void rbt_delete_fixup(RBTree *rbt, RBTreeNode *parent, uint8_t left) {
+    RBTreeNode *node = NULL;
+    while (parent) {
+        if (node) left = (parent->left == node);
 
-    if (child_cnt == 2) {
-        RBTreeNode *left_most_successor = node->right;
-        while (1) {
-            if (left_most_successor->left)
-                left_most_successor = left_most_successor->left;
-            else
-                break;
+        // The sibling cannot be NULL since the node side is one black short
+        RBTreeNode *sibling = left ? parent->right : parent->left;
+        RBTreeNode *close_nephew = left ? sibling->left : sibling->right;
+        RBTreeNode *distant_nephew = left ? sibling->right : sibling->left;
+
+        if (sibling->color == RBTN_RED) {
+            // Case D3: make the sibling black by rotating it above parent
+            rbt_rotate(rbt, parent, left);
+            parent->color = RBTN_RED;
+            sibling->color = RBTN_BLACK;
+            sibling = close_nephew;
+            close_nephew = left ? sibling->left : sibling->right;
+            distant_nephew = left ? sibling->right : sibling->left;
+            // Parent is now red so one of the cases D4-D6 applies below
         }
-        // Swap values
-        node->key = left_most_successor->key;
-        memcpy(node->value, left_most_successor->value, data_size);
-        rbt_delete_node(rbt, left_most_successor, data_size);
-        return;
+
+        if (!rbtn_is_red(distant_nephew) && rbtn_is_red(close_nephew)) {
+            // Case D5: rotate the close nephew into the distant position
+            rbt_rotate(rbt, sibling, !left);
+            sibling->color = RBTN_RED;
+            close_nephew->color = RBTN_BLACK;
+            distant_nephew = sibling;
+            sibling = close_nephew;
+        }
+
+        if (rbtn_is_red(distant_nephew)) {
+            // Case D6
+            rbt_rotate(rbt, parent, left);
+            sibling->color = parent->color;
+            parent->color = RBTN_BLACK;
+            distant_nephew->color = RBTN_BLACK;
+            return;
+        }
+
+        if (parent->color == RBTN_RED) {
+            // Case D4
+            sibling->color = RBTN_RED;
+            parent->color = RBTN_BLACK;
+            return;
+        }
+
+        // Case D2: everything is black, move the problem one level up
+        sibling->color = RBTN_RED;
+        node = parent;
+        parent = node->parent;
+    }
+}
+
+static void rbt_delete_node(RBTree *rbt, RBTreeNode *node) {
+    if (node->left && node->right) {
+        // Replace with in-order successor which has at most one child
+        RBTreeNode *successor = node->right;
+        while (successor->left) successor = successor->left;
+
+        node->key = successor->key;
+        void *tmp = node->value;
+        node->value = successor->value;
+        successor->value = tmp;
+        node = successor;
     }
 
-    if (child_cnt == 1) {
-        RBTreeNode *child = node->left ? node->left : node->right;
+    RBTreeNode *parent = node->parent;
+    RBTreeNode *child = node->left ? node->left : node->right;
+
+    if (child) {
+        // A node with exactly one child has to be black with a red child
+        child->parent = parent;
         child->color = RBTN_BLACK;
-        if (node_is_root) {
-            child->parent = NULL;
-            rbt->root = child;
-            rbtn_free_single(node);
-            return;
-        }
-        else {
-            child->parent = node->parent;
-            if (node->parent->left == node) node->parent->left = child;
-            else node->parent->right = child;
-            rbtn_free_single(node);
-            return;
-        }
-    }
-
-    // Otherwise, no children
-    if (node_is_root) {
-        rbtn_free_single(rbt->root);
-        rbt->root = NULL;
-        return;
-    }
-
-    if (node->color == RBTN_RED) {
-        if (node->parent->left == node) node->parent->left = NULL;
-        else node->parent->right = NULL;
+        rbt_replace_child(rbt, parent, node, child);
         rbtn_free_single(node);
         return;
     }
 
-    // Advanced case: no children and black
-    RBTreeNode *parent = node->parent;
-
-    // Remove node
-    uint8_t left_child = (parent->left == node);
+    uint8_t was_black = node->color == RBTN_BLACK;
+    uint8_t left_child = parent && parent->left == node;
+    rbt_replace_child(rbt, parent, node, NULL);
     rbtn_free_single(node);
-    node = NULL;
-    if (left_child) parent->left = NULL;
-    else parent->right = NULL;
 
-    RBTreeNode *sibling;
-    RBTreeNode *distant_nephew;
-    RBTreeNode *close_nephew;
-
-    uint8_t case_6 = 0;
-    uint8_t case_5 = 0;
-    while (parent) {
-        if (node) left_child = (parent->left == node);
-        sibling = left_child ? parent->right : parent->left;
-        distant_nephew = left_child ? sibling->right : sibling->left;
-        close_nephew = left_child ? sibling->left : sibling->right;
-
-        if (sibling->color == RBTN_RED) {
-            rbt_rotate(rbt, parent, left_child);
-            parent->color = RBTN_RED;
-            sibling->color = RBTN_BLACK;
-            sibling = close_nephew;
-
-            distant_nephew = left_child ? sibling->right : sibling->left;
-            if (distant_nephew && distant_nephew->color == RBTN_RED) {
-                case_6 = 1;
-                break;
-            }
-            close_nephew = left_child ? sibling->left : sibling->right;
-            if (close_nephew && close_nephew->color == RBTN_RED) {
-                case_5 = 1;
-                break;
-            }
-
-            sibling->color = RBTN_RED;
-            parent->color = RBTN_BLACK;
-            break;
-        }
-
-        if (distant_nephew && distant_nephew->color == RBTN_RED) {
-                case_6 = 1;
-                break;
-            }
-        
-        if (close_nephew && close_nephew->color == RBTN_RED) {
-            case_5 = 1;
-            break;
-        }
-
-        if (parent->color == RBTN_RED) {
-			sibling->color = RBTN_RED;
-			parent->color = RBTN_BLACK;
-			break;
-		}
-
-        if (!parent) break;
-
-        sibling->color = RBTN_RED;
-		node = parent;
-        parent = node->parent;
-    }
-
-    if (case_6) {
-        rbt_rotate(rbt, sibling, !left_child);
-        sibling->color = RBTN_RED;
-        close_nephew->color = RBTN_BLACK;
-        distant_nephew = sibling;
-        sibling = close_nephew;
-    }
-    
-    if (case_6 || case_5) {
-        rbt_rotate(rbt, parent, left_child);
-        sibling->color = parent->color; 
-        parent->color = RBTN_BLACK;  
-        distant_nephew->color = RBTN_BLACK;  
+    if (parent && was_black) {
+        rbt_delete_fixup(rbt, parent, left_child);
     }
 }
 
-void rbt_delete(RBTree *rbt, uint32_t key, size_t size) {
+uint8_t rbt_delete(RBTree *rbt, uint32_t key) {
     RBTreeNode *node = rbt_search(rbt, key);
     if (!node || node->key != key) {
-        printf("Node not found\n");
-        return;
+        return 0;
     }
 
     rbt->size--;
-    rbt_delete_node(rbt, node, size);
+    rbt_delete_node(rbt, node);
+    return 1;
 }
 
 void *rbt_get(RBTree *rbt, uint32_t key) {
@@ -427,7 +396,8 @@ void *rbt_get(RBTree *rbt, uint32_t key) {
 }
 
 void rbt_free(RBTree *rbt) {
-    if (rbt->root) rbtn_free(rbt->root);
+    if (!rbt) return;
+    rbtn_free(rbt->root);
     free(rbt);
 }
 
@@ -436,34 +406,41 @@ uint32_t rbt_size(RBTree *rbt) {
 }
 
 void rbt_clear(RBTree *rbt) {
-    if (rbt->root) rbtn_free(rbt->root);
+    rbtn_free(rbt->root);
     rbt->root = NULL;
     rbt->size = 0;
 }
 
-uint8_t rbt_verify_dfs(RBTree *rbt, RBTreeNode *node) {
+// Returns the black height of the subtree, or -1 if any invariant is broken.
+// All keys in the subtree have to be in [lower, upper].
+static int rbt_verify_dfs(RBTreeNode *node, RBTreeNode *parent,
+        uint64_t lower, uint64_t upper, uint32_t *count) {
     if (!node) return 1;
-    if (node->parent && node->parent->color == RBTN_RED 
-        && node->color == RBTN_RED) return 255;
-    uint8_t black_cnt_left = rbt_verify_dfs(rbt, node->left);
-    uint8_t black_cnt_right = rbt_verify_dfs(rbt, node->right);
-    if (black_cnt_left == 255 || black_cnt_right == 255 || 
-            black_cnt_left != black_cnt_right) {    
-        return -1;
-    }
-    return black_cnt_left;
+    if (node->parent != parent) return -1;
+    if (node->key < lower || node->key > upper) return -1;
+    if (node->color == RBTN_RED && rbtn_is_red(parent)) return -1;
+    (*count)++;
+
+    int left = rbt_verify_dfs(node->left, node, lower,
+        (uint64_t)node->key - 1, count);
+    int right = rbt_verify_dfs(node->right, node,
+        (uint64_t)node->key + 1, upper, count);
+    if (left < 0 || right < 0 || left != right) return -1;
+    return left + (node->color == RBTN_BLACK);
 }
 
 uint8_t rbt_verify_tree(RBTree *rbt) {
-    uint8_t black_nodes_cnt = rbt_verify_dfs(rbt, rbt->root);
-    if (black_nodes_cnt == 255) return 0;
-    return 1;
+    if (rbtn_is_red(rbt->root)) return 0;
+    uint32_t count = 0;
+    if (rbt_verify_dfs(rbt->root, NULL, 0, UINT32_MAX, &count) < 0) return 0;
+    return count == rbt->size;
 }
 
 void rbt_print(RBTree *rbt) {
     if (!rbt->root) return;
 
-    RBTreeNode *queue[1024];
+    RBTreeNode **queue = malloc(sizeof(RBTreeNode*) * rbt->size);
+    if (!queue) return;
     uint32_t front = 0, back = 0;
 
     uint32_t nodes_in_level = 1;
@@ -475,7 +452,7 @@ void rbt_print(RBTree *rbt) {
         RBTreeNode *node = queue[front++];
         nodes_in_level--;
 
-        printf("[k%u, f%d, v%p] ", node->key, node->color, node->value);
+        printf("[k%u, %c] ", node->key, node->color == RBTN_RED ? 'r' : 'b');
 
         if (node->left) {
             queue[back++] = node->left;
@@ -492,30 +469,40 @@ void rbt_print(RBTree *rbt) {
             nodes_next_level = 0;
         }
     }
+    free(queue);
 }
 
 
 #define HEAP_DEFAULT_SIZE 0x8
 
 struct Heap {
-    void *data;
+    uint8_t *data;
     uint32_t size;
     uint32_t resvsize;
     cmpf cmp;
     size_t type_size;
+    void *scratch; // Temporary storage of one element, used when swapping
 };
 
-uint8_t u32_greater(void *a, void *b) {
-    return *(uint32_t*)a < *(uint32_t*)b;
+static uint8_t u32_greater(const void *a, const void *b) {
+    return *(const uint32_t*)a < *(const uint32_t*)b;
 }
 
-uint8_t u32_lesser(void *a, void *b) {
-    return *(uint32_t*)a > *(uint32_t*)b;
+static uint8_t u32_lesser(const void *a, const void *b) {
+    return *(const uint32_t*)a > *(const uint32_t*)b;
 }
 
 Heap *new_heap(cmpf cmp, size_t type_size) {
     Heap *heap = malloc(sizeof(Heap));
+    if (!heap) return NULL;
     heap->data = malloc(type_size * HEAP_DEFAULT_SIZE);
+    heap->scratch = malloc(type_size);
+    if (!heap->data || !heap->scratch) {
+        free(heap->data);
+        free(heap->scratch);
+        free(heap);
+        return NULL;
+    }
     heap->size = 0;
     heap->resvsize = HEAP_DEFAULT_SIZE;
     heap->cmp = cmp;
@@ -523,53 +510,43 @@ Heap *new_heap(cmpf cmp, size_t type_size) {
     return heap;
 }
 
-Heap *new_maxheap() {
+Heap *new_maxheap(void) {
     return new_heap(u32_greater, sizeof(uint32_t));
 }
 
-Heap *new_minheap() {
+Heap *new_minheap(void) {
     return new_heap(u32_lesser, sizeof(uint32_t));
 }
 
-void swap(Heap *heap, void *a, void *b) {
-    void *tmp = malloc(heap->type_size);
-    memcpy(tmp, a, heap->type_size);
-    memcpy(a, b, heap->type_size);
-    memcpy(b, tmp, heap->type_size);
-    free(tmp);
+static void *datai(Heap *heap, uint32_t i) {
+    return heap->data + (size_t)i * heap->type_size;
 }
 
-uint32_t ileftchild(uint32_t i) {
+static void swap(Heap *heap, uint32_t a, uint32_t b) {
+    memcpy(heap->scratch, datai(heap, a), heap->type_size);
+    memcpy(datai(heap, a), datai(heap, b), heap->type_size);
+    memcpy(datai(heap, b), heap->scratch, heap->type_size);
+}
+
+static uint32_t ileftchild(uint32_t i) {
     return 2 * i + 1;
 }
 
-uint32_t irightchild(uint32_t i) {
-    return 2 * i + 2;
-}
-
-uint32_t iparent(uint32_t i) {
-    if (i == 0) {
-        return 0;
-    }
+static uint32_t iparent(uint32_t i) {
     return (i - 1) / 2;
 }
 
-void *datai(Heap *heap, uint32_t i) {
-    return (void*)(heap->data + i * heap->type_size);
-}
-
-void sift_down(Heap *heap, uint32_t start, uint32_t end) {
-
+static void sift_down(Heap *heap, uint32_t start, uint32_t end) {
     uint32_t root = start;
     while (ileftchild(root) < end) {
         uint32_t child = ileftchild(root);
-        if (child + 1 < end && 
+        if (child + 1 < end &&
                 heap->cmp(datai(heap, child), datai(heap, child + 1))) {
             child++;
         }
 
         if (heap->cmp(datai(heap, root), datai(heap, child))) {
-            swap(heap, datai(heap, root), datai(heap, child));
+            swap(heap, root, child);
             root = child;
         }
         else {
@@ -578,13 +555,12 @@ void sift_down(Heap *heap, uint32_t start, uint32_t end) {
     }
 }
 
-void sift_up(Heap *heap, uint32_t start) {
-    
+static void sift_up(Heap *heap, uint32_t start) {
     uint32_t root = start;
     while (root != 0) {
         uint32_t parent = iparent(root);
-        if (!heap->cmp(datai(heap, root), datai(heap, parent))) {
-            swap(heap, datai(heap, root), datai(heap, parent));
+        if (heap->cmp(datai(heap, parent), datai(heap, root))) {
+            swap(heap, root, parent);
             root = parent;
         }
         else {
@@ -601,16 +577,19 @@ void *heap_top(Heap *heap) {
     return datai(heap, 0);
 }
 
-void heap_insert(Heap *heap, void *value) {
+uint8_t heap_insert(Heap *heap, const void *value) {
     if (heap->size == heap->resvsize) {
+        uint8_t *grown = realloc(heap->data,
+            (size_t)heap->resvsize * 2 * heap->type_size);
+        if (!grown) return 0;
+        heap->data = grown;
         heap->resvsize *= 2;
-        heap->data = realloc(heap->data, heap->resvsize * heap->type_size);
     }
 
-    void *dst = datai(heap, heap->size);
-    memcpy(dst, value, heap->type_size);
+    memcpy(datai(heap, heap->size), value, heap->type_size);
     heap->size++;
     sift_up(heap, heap->size - 1);
+    return 1;
 }
 
 void heap_pop(Heap *heap) {
@@ -623,7 +602,7 @@ void heap_pop(Heap *heap) {
         return;
     }
 
-    swap(heap, datai(heap, heap->size), datai(heap, 0));
+    swap(heap, heap->size, 0);
     sift_down(heap, 0, heap->size);
 }
 
@@ -636,6 +615,8 @@ uint8_t heap_is_empty(Heap *heap) {
 }
 
 void heap_free(Heap *heap) {
+    if (!heap) return;
     free(heap->data);
+    free(heap->scratch);
     free(heap);
 }
